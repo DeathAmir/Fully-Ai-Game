@@ -1,0 +1,16 @@
+/build/
+/out/
+/.vs/
+/.idea/
+/.vscode/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.pdb
+*.ilk
+*.obj
+*.exe
+*.dll
+*.zip
+

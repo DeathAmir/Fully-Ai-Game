@@ -1,0 +1,79 @@
+name: Windows Build and Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -A x64
+          -DCMAKE_BUILD_TYPE=Release
+          -DNEON_FETCH_ASSETS=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Headless self-test
+        run: .\build\Release\NeonAssault.exe --self-test
+
+      - name: Install portable package
+        run: cmake --install build --config Release --prefix dist/NeonAssault
+
+      - name: Add launcher and documentation
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist/NeonAssault/README.md
+          Copy-Item LICENSE dist/NeonAssault/LICENSE.txt
+          @'
+          @echo off
+          cd /d "%~dp0"
+          start "" NeonAssault.exe
+          '@ | Set-Content -Encoding ascii dist/NeonAssault/PLAY.bat
+
+      - name: Create ZIP
+        shell: pwsh
+        run: Compress-Archive -Path dist/NeonAssault/* -DestinationPath NeonAssault-Windows-x64.zip -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeonAssault-Windows-x64
+          path: NeonAssault-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: Neon Assault v0.1.${{ github.run_number }}
+          body: |
+            Playable Windows x64 build of Neon Assault.
+
+            Download `NeonAssault-Windows-x64.zip`, extract it, and run `PLAY.bat`.
+            The archive includes the executable, SDL3 runtime, licensed game assets, credits, and license files.
+          files: NeonAssault-Windows-x64.zip
+          generate_release_notes: true
+          make_latest: true
+
