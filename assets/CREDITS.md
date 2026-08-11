@@ -37,6 +37,11 @@ Creator: **Quaternius** — <https://quaternius.com/>
   rifles. Creator page: <https://quaternius.com/packs/ultimategun.html>
   Distribution mirror: <https://poly.pizza/bundle/Ultimate-Guns-Pack-cpgUfI4t2F>
 
+The mirror's exact GLB archive is vendored at
+`third_party/assets/quaternius-ultimate-guns-glb.zip` because its CDN rejects
+requests from GitHub-hosted runners. Its SHA-256 is pinned and verified before
+extraction: `b2a37e8b30df08f5f3f239c4e1649446208b70cb111be39386cf2b1ccfa486ea`.
+
 License: <https://creativecommons.org/publicdomain/zero/1.0/>
 
 ## Khronos glTF Sample Assets — Creative Commons CC0 1.0 Universal

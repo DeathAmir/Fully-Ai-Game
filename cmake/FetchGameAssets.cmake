@@ -76,6 +76,28 @@ function(neon_download_archive archive_name source_url expected_sha256 output_di
     file(COPY ${pack_models} DESTINATION "${NEON_GENERATED_ASSET_DIR}/${output_directory}")
 endfunction()
 
+function(neon_import_local_archive archive_name relative_path expected_sha256 output_directory)
+    set(archive_path "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}")
+    set(extract_directory "${CMAKE_BINARY_DIR}/licensed_asset_extract/${archive_name}")
+    if(NOT EXISTS "${archive_path}")
+        message(FATAL_ERROR "Vendored licensed archive is missing: ${relative_path}")
+    endif()
+    file(SHA256 "${archive_path}" actual_sha256)
+    if(NOT actual_sha256 STREQUAL expected_sha256)
+        message(FATAL_ERROR "Vendored licensed archive hash mismatch: ${relative_path}")
+    endif()
+    file(REMOVE_RECURSE "${extract_directory}")
+    file(MAKE_DIRECTORY "${extract_directory}")
+    file(ARCHIVE_EXTRACT INPUT "${archive_path}" DESTINATION "${extract_directory}")
+    file(REMOVE_RECURSE "${NEON_GENERATED_ASSET_DIR}/${output_directory}")
+    file(MAKE_DIRECTORY "${NEON_GENERATED_ASSET_DIR}/${output_directory}")
+    file(GLOB pack_models "${extract_directory}/*.glb")
+    if(NOT pack_models)
+        message(FATAL_ERROR "No GLB models found in vendored pack ${archive_name}")
+    endif()
+    file(COPY ${pack_models} DESTINATION "${NEON_GENERATED_ASSET_DIR}/${output_directory}")
+endfunction()
+
 file(MAKE_DIRECTORY "${NEON_GENERATED_ASSET_DIR}")
 
 neon_download_asset("SciFiHelmet/SciFiHelmet.gltf"
@@ -143,11 +165,11 @@ neon_download_archive(
     "Maps/SpaceStation"
 )
 
-# Quaternius' Ultimate Guns Pack is public domain (CC0). Poly Pizza mirrors the
-# creator's 25 GLB exports as one deterministic archive.
-neon_download_archive(
+# Quaternius' Ultimate Guns Pack is public domain (CC0). The exact Poly Pizza
+# archive is vendored because its CDN blocks GitHub-hosted build runners.
+neon_import_local_archive(
     "quaternius-ultimate-guns"
-    "https://static.poly.pizza/list/cpgUfI4t2F-glb--2115088357.zip"
+    "third_party/assets/quaternius-ultimate-guns-glb.zip"
     "b2a37e8b30df08f5f3f239c4e1649446208b70cb111be39386cf2b1ccfa486ea"
     "Guns/Quaternius"
 )
