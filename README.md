@@ -1,71 +1,89 @@
-# NEON ASSAULT
+# NEON ASSAULT — Arsenal Update
 
-A fast, single-player 3D arena shooter written in modern C++ using SDL3 and
-OpenGL 3.3. Fight increasingly aggressive bot waves, rotate between six
-weapons, collect health and ammunition, and chase a high score.
+Neon Assault is a single-player 3D arena shooter written in C++20 with SDL3
+and OpenGL 3.3. Version 0.2 expands the original prototype into a licensed
+content build with animated operators, real weapon meshes, tactical bots,
+multiple modes, inventory, rarity tiers and persistent achievements.
 
-## Current playable features
+## Playable content
 
-- Responsive first-person mouse look, WASD movement, sprint, crouch, and jump
-- Six weapons: pistol, assault rifle, shotgun, SMG, DMR, and sniper rifle
-- Magazine/reserve ammo, weapon switching, recoil, spread, reload timing,
-  tracers, muzzle flashes, and hit markers
-- Wave-based bots with chase, strafe, retreat, line-of-sight, obstacle
-  avoidance, accuracy pressure, and ranged attacks
-- Three selectable arenas (Neon Yard, Dust Depot, Ice Lab), collision, cover,
-  pickups, scoring, death and restart flow
-- Pre-match lobby controls for map, difficulty, and Potato/Balanced/Ultra
-  graphics profiles; the Potato profile reduces bot and particle budgets
-- OpenGL lighting, fog, particles, view-models, damage vignette, and bitmap HUD
-- Procedural SDL3 audio for shots, hits, pickups, reloads, and UI feedback
-- Internet-sourced glTF props with pinned hashes and explicit license credits
-- Reproducible CMake build and a GitHub Actions Windows x64 Release ZIP
+- **6 maps:** Neon Yard, Dust Depot, Ice Lab, Suburban Siege, Orbital Station
+  and Iron Foundry. The last three use optimized CC0 environment packs from
+  Kenney with independent collision proxies for reliable movement and AI.
+- **10 balanced weapons:** pistol, assault rifle, shotgun, SMG, DMR, sniper,
+  Nova Blaster, Dragon Core, Void Cannon and Rail Lancer.
+- **Rarity system:** Common, Uncommon, Rare, Epic, Legendary and Mythic.
+  Legendary and Mythic equipment has unique accent rendering; Mythic weapons
+  produce radial neon kill effects.
+- **Licensed model library:** 25 recognizable firearm/attachment models by
+  Quaternius, 40 Kenney blaster assets, 18 operator variants and more than 200
+  map GLBs. Every upstream archive has a pinned SHA-256 hash.
+- **4 full-body operators:** Wraith, Viper, Nomad and Spectre. Object-based
+  glTF animation supports idle, sprint, armed and shooting clips without a
+  heavyweight engine runtime.
+- **Tactical bots:** A* navigation grid, obstacle routing, visual memory,
+  gunshot hearing, reaction delay, burst fire, target leading, dynamic cover,
+  separation and four complementary roles: assault, flanker, marksman and
+  rusher.
+- **4 modes:** Survival, Elimination, Head Hunter and Mythic Mayhem.
+- **Inventory and loadout:** select weapons in the lobby or in the in-game
+  Arsenal screen, with damage, magazine and rarity information.
+- **8 persistent achievements:** progress is stored in SDL's per-user
+  preference directory and survives restarts.
+- First-person and third-person cameras, responsive mouse aim, sprint, crouch,
+  jump, recoil, reloads, ammo pickups, headshots, procedural audio, particles,
+  damage feedback and scalable Potato/Balanced/Ultra profiles.
 
 ## Controls
 
 | Input | Action |
 |---|---|
 | `W A S D` | Move |
-| Mouse | Aim |
-| Left mouse | Fire |
+| Mouse / left mouse | Aim / fire |
 | `R` | Reload |
-| `1` through `6` or wheel | Select weapon |
-| `Shift` | Sprint |
-| `Ctrl` | Crouch |
-| `Space` | Jump |
+| `1` through `0` or wheel | Select one of ten weapons |
+| `Shift` / `Ctrl` / `Space` | Sprint / crouch / jump |
+| `Tab` | Arsenal inventory and achievements |
+| `V` | Toggle first/third-person camera |
 | `Esc` | Pause / release mouse |
 | `Enter` | Start / restart |
-| `M` / `D` / `Q` in lobby | Change map / difficulty / graphics profile |
+| `M` in lobby | Change map |
+| `G` in lobby | Change game mode |
+| `C` in lobby | Change operator |
+| `D` / `Q` in lobby | Change difficulty / graphics profile |
 
-## Download for Windows
+## Windows download
 
 Open the repository's **Releases** page, download
 `NeonAssault-Windows-x64.zip`, extract the entire archive, and run `PLAY.bat`.
-Do not run the executable from inside the ZIP.
+The ZIP is portable and includes SDL3 plus the licensed runtime content. OpenGL
+is supplied by the Windows graphics driver.
 
 ## Build from source
 
-Requirements: Git, CMake 3.25+, a C++20 compiler, and internet access during
-the first configure. Dependencies and licensed models are pinned and fetched by
-CMake.
+Requirements: Git, CMake 3.25+, a C++20 compiler and internet access during the
+first configure. SDL3, GLM, GLEW, tinygltf and all licensed content are pinned
+and fetched reproducibly.
 
 ```bash
-cmake -S . -B build
+cmake -S . -B build -DNEON_FETCH_ASSETS=ON
 cmake --build build --config Release --parallel
 ```
 
-On Windows with Visual Studio, the executable is normally written to
-`build/Release/`. To create a portable directory:
+Create a portable directory on Windows:
 
 ```bash
 cmake --install build --config Release --prefix dist/NeonAssault
 ```
 
-For a source-only/offline configure, pass `-DNEON_FETCH_ASSETS=OFF`; procedural
-fallback art remains playable, while the external helmet and bottle props are
-omitted.
+`-DNEON_FETCH_ASSETS=OFF` creates a source-only fallback build without the
+external models. Procedural geometry remains available when an optional model
+cannot be loaded.
 
-## Asset and dependency licenses
+## Licensing and provenance
 
-See [`assets/CREDITS.md`](assets/CREDITS.md). Downloaded asset integrity is
-verified with SHA-256 before it is accepted into a build.
+All bundled art is CC0. Exact creators, pack names, source pages and license
+links are documented in [`assets/CREDITS.md`](assets/CREDITS.md). Upstream
+archives and individual Khronos models are checked against SHA-256 hashes in
+[`cmake/FetchGameAssets.cmake`](cmake/FetchGameAssets.cmake). The project does
+not redistribute ripped assets or content from commercial games.

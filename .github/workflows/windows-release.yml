@@ -50,6 +50,29 @@ jobs:
           start "" NeonAssault.exe
           '@ | Set-Content -Encoding ascii dist/NeonAssault/PLAY.bat
 
+      - name: Verify portable content
+        shell: pwsh
+        run: |
+          $required = @(
+            'dist/NeonAssault/NeonAssault.exe',
+            'dist/NeonAssault/SDL3.dll',
+            'dist/NeonAssault/PLAY.bat',
+            'dist/NeonAssault/assets/CREDITS.md',
+            'dist/NeonAssault/assets/Characters/character-a.glb',
+            'dist/NeonAssault/assets/Guns/Quaternius/Pistol.glb',
+            'dist/NeonAssault/assets/Guns/Blasters/blaster-a.glb',
+            'dist/NeonAssault/assets/Maps/Industrial/building-a.glb',
+            'dist/NeonAssault/assets/Maps/Suburban/building-type-a.glb',
+            'dist/NeonAssault/assets/Maps/Roads/road-straight.glb',
+            'dist/NeonAssault/assets/Maps/SpaceStation/wall.glb'
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) { throw "Portable package is missing $file" }
+          }
+          $modelCount = @(Get-ChildItem dist/NeonAssault/assets -Recurse -Filter *.glb).Count
+          if ($modelCount -lt 200) { throw "Expected at least 200 licensed GLB assets, found $modelCount" }
+          Write-Host "Verified $modelCount licensed GLB assets in portable package."
+
       - name: Create ZIP
         shell: pwsh
         run: Compress-Archive -Path dist/NeonAssault/* -DestinationPath NeonAssault-Windows-x64.zip -Force
@@ -66,14 +89,18 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.${{ github.run_number }}
-          name: Neon Assault v0.1.${{ github.run_number }}
+          tag_name: v0.2.${{ github.run_number }}
+          name: Neon Assault Arsenal Update v0.2.${{ github.run_number }}
           body: |
-            Playable Windows x64 build of Neon Assault.
+            Windows x64 build of the Neon Assault Arsenal Update.
 
             Download `NeonAssault-Windows-x64.zip`, extract it, and run `PLAY.bat`.
-            The archive includes the executable, SDL3 runtime, licensed game assets, credits, and license files.
+            Includes 6 maps, 10 gameplay weapons, 40+ licensed weapon models,
+            animated full-body operators, tactical A* bots, 4 game modes,
+            persistent achievements, inventory, rarity tiers and Mythic kill effects.
+
+            The archive includes the executable, SDL3 runtime, pinned CC0 assets,
+            complete creator credits, integrity information and license files.
           files: NeonAssault-Windows-x64.zip
           generate_release_notes: true
           make_latest: true
-

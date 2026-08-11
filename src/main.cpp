@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -22,15 +23,18 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <random>
 #include <span>
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -512,6 +516,10 @@ public:
             return false;
         }
 
+        parts_.clear();
+        animations_.clear();
+        nodes_.clear();
+
         textures_.assign(model.images.size(), 0);
         std::vector<bool> neededImages(model.images.size(), false);
         for (const auto& material : model.materials) {
@@ -570,29 +578,189 @@ public:
             textures_[i] = texture;
         }
 
+        nodes_.resize(model.nodes.size());
+        for (std::size_t i = 0; i < model.nodes.size(); ++i) {
+            const tinygltf::Node& source = model.nodes[i];
+            Node& destination = nodes_[i];
+            destination.baseMatrix = nodeMatrix(source);
+            if (source.translation.size() == 3) {
+                destination.translation = {static_cast<float>(source.translation[0]),
+                                           static_cast<float>(source.translation[1]),
+                                           static_cast<float>(source.translation[2])};
+            }
+            if (source.scale.size() == 3) {
+                destination.scale = {static_cast<float>(source.scale[0]), static_cast<float>(source.scale[1]),
+                                     static_cast<float>(source.scale[2])};
+            }
+            if (source.rotation.size() == 4) {
+                destination.rotation = {static_cast<float>(source.rotation[3]),
+                                        static_cast<float>(source.rotation[0]),
+                                        static_cast<float>(source.rotation[1]),
+                                        static_cast<float>(source.rotation[2])};
+            }
+            destination.usesMatrix = source.matrix.size() == 16;
+            destination.children = source.children;
+            for (int child : source.children) {
+                if (child >= 0 && child < static_cast<int>(nodes_.size()))
+                    nodes_[static_cast<std::size_t>(child)].parent = static_cast<int>(i);
+            }
+        }
+
         const int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : (model.scenes.empty() ? -1 : 0);
         if (sceneIndex < 0) return false;
+        sceneRoots_ = model.scenes[static_cast<std::size_t>(sceneIndex)].nodes;
         for (int node : model.scenes[static_cast<std::size_t>(sceneIndex)].nodes) {
-            visitNode(model, node, glm::mat4(1.0f));
+            visitNode(model, node);
+        }
+
+        for (const tinygltf::Animation& sourceAnimation : model.animations) {
+            Animation animation;
+            animation.name = sourceAnimation.name;
+            for (const tinygltf::AnimationChannel& sourceChannel : sourceAnimation.channels) {
+                if (sourceChannel.target_node < 0 ||
+                    sourceChannel.target_node >= static_cast<int>(nodes_.size()) ||
+                    sourceChannel.sampler < 0 ||
+                    sourceChannel.sampler >= static_cast<int>(sourceAnimation.samplers.size())) continue;
+                const tinygltf::AnimationSampler& sampler =
+                    sourceAnimation.samplers[static_cast<std::size_t>(sourceChannel.sampler)];
+                if (sampler.input < 0 || sampler.output < 0) continue;
+                const tinygltf::Accessor& input = model.accessors[static_cast<std::size_t>(sampler.input)];
+                const tinygltf::Accessor& output = model.accessors[static_cast<std::size_t>(sampler.output)];
+                AnimationChannel channel;
+                channel.node = sourceChannel.target_node;
+                channel.step = sampler.interpolation == "STEP";
+                if (sourceChannel.target_path == "translation") channel.path = AnimationPath::Translation;
+                else if (sourceChannel.target_path == "rotation") channel.path = AnimationPath::Rotation;
+                else if (sourceChannel.target_path == "scale") channel.path = AnimationPath::Scale;
+                else continue;
+                const std::size_t sampleCount = std::min(input.count, output.count);
+                channel.times.reserve(sampleCount);
+                channel.values.reserve(sampleCount);
+                for (std::size_t sample = 0; sample < sampleCount; ++sample) {
+                    const float sampleTime = readFloat(model, input, sample);
+                    channel.times.push_back(sampleTime);
+                    channel.values.push_back(channel.path == AnimationPath::Rotation
+                        ? readVec4(model, output, sample)
+                        : glm::vec4(readVec3(model, output, sample), 0.0f));
+                    animation.duration = std::max(animation.duration, sampleTime);
+                }
+                if (!channel.times.empty()) animation.channels.push_back(std::move(channel));
+            }
+            if (!animation.channels.empty()) animations_.push_back(std::move(animation));
         }
         return !parts_.empty();
     }
 
     void draw(Renderer& renderer, const glm::mat4& transform, const glm::vec4& tint = glm::vec4(1.0f)) const {
+        drawAnimated(renderer, transform, -1, 0.0f, tint);
+    }
+
+    void drawAnimated(Renderer& renderer, const glm::mat4& transform, int animationIndex, float animationTime,
+                      const glm::vec4& tint = glm::vec4(1.0f)) const {
+        std::vector<glm::vec3> translations;
+        std::vector<glm::quat> rotations;
+        std::vector<glm::vec3> scales;
+        translations.reserve(nodes_.size());
+        rotations.reserve(nodes_.size());
+        scales.reserve(nodes_.size());
+        for (const Node& node : nodes_) {
+            translations.push_back(node.translation);
+            rotations.push_back(node.rotation);
+            scales.push_back(node.scale);
+        }
+        if (animationIndex >= 0 && animationIndex < static_cast<int>(animations_.size())) {
+            const Animation& animation = animations_[static_cast<std::size_t>(animationIndex)];
+            const float localTime = animation.duration > 0.0f ? std::fmod(animationTime, animation.duration) : 0.0f;
+            for (const AnimationChannel& channel : animation.channels) {
+                if (channel.times.empty()) continue;
+                const auto upper = std::upper_bound(channel.times.begin(), channel.times.end(), localTime);
+                const std::size_t second = upper == channel.times.end()
+                    ? channel.times.size() - 1 : static_cast<std::size_t>(upper - channel.times.begin());
+                const std::size_t first = second == 0 ? 0 : second - 1;
+                float blend = 0.0f;
+                if (!channel.step && second != first) {
+                    const float span = channel.times[second] - channel.times[first];
+                    if (span > 0.00001f) blend = saturate((localTime - channel.times[first]) / span);
+                }
+                const glm::vec4 value = glm::mix(channel.values[first], channel.values[second], blend);
+                const std::size_t nodeIndex = static_cast<std::size_t>(channel.node);
+                if (channel.path == AnimationPath::Translation) translations[nodeIndex] = glm::vec3(value);
+                else if (channel.path == AnimationPath::Scale) scales[nodeIndex] = glm::vec3(value);
+                else {
+                    const glm::quat firstRotation(channel.values[first].w, channel.values[first].x,
+                                                  channel.values[first].y, channel.values[first].z);
+                    const glm::quat secondRotation(channel.values[second].w, channel.values[second].x,
+                                                   channel.values[second].y, channel.values[second].z);
+                    rotations[nodeIndex] = glm::normalize(glm::slerp(firstRotation, secondRotation, blend));
+                }
+            }
+        }
+
+        std::vector<glm::mat4> worlds(nodes_.size(), glm::mat4(1.0f));
+        std::vector<bool> resolved(nodes_.size(), false);
+        const std::function<const glm::mat4&(int)> resolve = [&](int index) -> const glm::mat4& {
+            const std::size_t nodeIndex = static_cast<std::size_t>(index);
+            if (resolved[nodeIndex]) return worlds[nodeIndex];
+            const Node& node = nodes_[nodeIndex];
+            const bool animated = animationIndex >= 0 && !node.usesMatrix;
+            const glm::mat4 local = animated
+                ? glm::translate(glm::mat4(1.0f), translations[nodeIndex]) *
+                  glm::mat4_cast(rotations[nodeIndex]) * glm::scale(glm::mat4(1.0f), scales[nodeIndex])
+                : node.baseMatrix;
+            worlds[nodeIndex] = node.parent >= 0 ? resolve(node.parent) * local : local;
+            resolved[nodeIndex] = true;
+            return worlds[nodeIndex];
+        };
+        for (int root : sceneRoots_) if (root >= 0) resolve(root);
+
         for (const Part& part : parts_) {
             const glm::vec4 color = part.color * tint;
-            renderer.draw(part.mesh, transform * part.transform, color, part.texture);
+            const glm::mat4 nodeTransform = part.node >= 0 ? resolve(part.node) : glm::mat4(1.0f);
+            renderer.draw(part.mesh, transform * nodeTransform, color, part.texture);
         }
     }
 
     bool valid() const { return !parts_.empty(); }
 
+    int findAnimation(std::string_view name) const {
+        for (std::size_t i = 0; i < animations_.size(); ++i) {
+            if (animations_[i].name == name) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
 private:
     struct Part {
         Mesh mesh;
-        glm::mat4 transform{1.0f};
+        int node = -1;
         glm::vec4 color{1.0f};
         GLuint texture = 0;
+    };
+
+    struct Node {
+        glm::mat4 baseMatrix{1.0f};
+        glm::vec3 translation{0.0f};
+        glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+        glm::vec3 scale{1.0f};
+        std::vector<int> children;
+        int parent = -1;
+        bool usesMatrix = false;
+    };
+
+    enum class AnimationPath { Translation, Rotation, Scale };
+
+    struct AnimationChannel {
+        int node = -1;
+        AnimationPath path = AnimationPath::Translation;
+        std::vector<float> times;
+        std::vector<glm::vec4> values;
+        bool step = false;
+    };
+
+    struct Animation {
+        std::string name;
+        float duration = 0.0f;
+        std::vector<AnimationChannel> channels;
     };
 
     static glm::mat4 nodeMatrix(const tinygltf::Node& node) {
@@ -646,6 +814,21 @@ private:
         return {value[0], value[1]};
     }
 
+    static glm::vec4 readVec4(const tinygltf::Model& model, const tinygltf::Accessor& accessor,
+                              std::size_t index) {
+        const auto& view = model.bufferViews[static_cast<std::size_t>(accessor.bufferView)];
+        const std::size_t stride = accessor.ByteStride(view) != 0 ? accessor.ByteStride(view) : sizeof(float) * 4;
+        const auto* value = reinterpret_cast<const float*>(accessorData(model, accessor) + index * stride);
+        return {value[0], value[1], value[2], value[3]};
+    }
+
+    static float readFloat(const tinygltf::Model& model, const tinygltf::Accessor& accessor,
+                           std::size_t index) {
+        const auto& view = model.bufferViews[static_cast<std::size_t>(accessor.bufferView)];
+        const std::size_t stride = accessor.ByteStride(view) != 0 ? accessor.ByteStride(view) : sizeof(float);
+        return *reinterpret_cast<const float*>(accessorData(model, accessor) + index * stride);
+    }
+
     static std::uint32_t readIndex(const tinygltf::Model& model, const tinygltf::Accessor& accessor,
                                    std::size_t index) {
         const auto& view = model.bufferViews[static_cast<std::size_t>(accessor.bufferView)];
@@ -660,9 +843,8 @@ private:
         }
     }
 
-    void visitNode(const tinygltf::Model& model, int nodeIndex, const glm::mat4& parent) {
+    void visitNode(const tinygltf::Model& model, int nodeIndex) {
         const tinygltf::Node& node = model.nodes[static_cast<std::size_t>(nodeIndex)];
-        const glm::mat4 world = parent * nodeMatrix(node);
         if (node.mesh >= 0) {
             const tinygltf::Mesh& sourceMesh = model.meshes[static_cast<std::size_t>(node.mesh)];
             for (const tinygltf::Primitive& primitive : sourceMesh.primitives) {
@@ -695,7 +877,7 @@ private:
 
                 Part part;
                 part.mesh.upload(vertices, indices);
-                part.transform = world;
+                part.node = nodeIndex;
                 if (primitive.material >= 0) {
                     const auto& material = model.materials[static_cast<std::size_t>(primitive.material)];
                     const auto& factor = material.pbrMetallicRoughness.baseColorFactor;
@@ -713,11 +895,14 @@ private:
                 parts_.push_back(std::move(part));
             }
         }
-        for (int child : node.children) visitNode(model, child, world);
+        for (int child : node.children) visitNode(model, child);
     }
 
     std::vector<Part> parts_;
     std::vector<GLuint> textures_;
+    std::vector<Node> nodes_;
+    std::vector<int> sceneRoots_;
+    std::vector<Animation> animations_;
 };
 
 enum class SoundEffect { Pistol, Rifle, Shotgun, Enemy, Hit, Kill, Pickup, Reload, Empty, Start };
@@ -840,19 +1025,62 @@ struct InputFrame {
     bool reloadPressed = false;
     bool pausePressed = false;
     bool confirmPressed = false;
-    std::array<bool, 6> weaponPressed{};
+    std::array<bool, 10> weaponPressed{};
     bool mapPressed = false;
     bool difficultyPressed = false;
     bool qualityPressed = false;
+    bool gameModePressed = false;
+    bool operatorPressed = false;
+    bool inventoryPressed = false;
+    bool thirdPersonPressed = false;
 
     void clearTransient() {
         mouseX = mouseY = 0.0f;
         wheel = 0;
         firePressed = reloadPressed = pausePressed = confirmPressed = false;
         mapPressed = difficultyPressed = qualityPressed = false;
+        gameModePressed = operatorPressed = inventoryPressed = thirdPersonPressed = false;
         weaponPressed.fill(false);
     }
 };
+
+enum class Rarity { Common, Uncommon, Rare, Epic, Legendary, Mythic };
+
+const char* rarityName(Rarity rarity) {
+    switch (rarity) {
+        case Rarity::Common: return "COMMON";
+        case Rarity::Uncommon: return "UNCOMMON";
+        case Rarity::Rare: return "RARE";
+        case Rarity::Epic: return "EPIC";
+        case Rarity::Legendary: return "LEGENDARY";
+        case Rarity::Mythic: return "MYTHIC";
+    }
+    return "COMMON";
+}
+
+glm::vec4 rarityColor(Rarity rarity) {
+    switch (rarity) {
+        case Rarity::Common: return {0.72f, 0.76f, 0.82f, 1.0f};
+        case Rarity::Uncommon: return {0.18f, 0.92f, 0.38f, 1.0f};
+        case Rarity::Rare: return {0.10f, 0.56f, 1.0f, 1.0f};
+        case Rarity::Epic: return {0.68f, 0.20f, 1.0f, 1.0f};
+        case Rarity::Legendary: return {1.0f, 0.58f, 0.08f, 1.0f};
+        case Rarity::Mythic: return {1.0f, 0.08f, 0.38f, 1.0f};
+    }
+    return glm::vec4(1.0f);
+}
+
+enum class GameMode { Survival, Elimination, HeadHunter, Mayhem };
+
+const char* gameModeName(GameMode mode) {
+    switch (mode) {
+        case GameMode::Survival: return "SURVIVAL";
+        case GameMode::Elimination: return "ELIMINATION";
+        case GameMode::HeadHunter: return "HEAD HUNTER";
+        case GameMode::Mayhem: return "MYTHIC MAYHEM";
+    }
+    return "SURVIVAL";
+}
 
 struct WeaponDefinition {
     const char* name = "PISTOL";
@@ -866,6 +1094,8 @@ struct WeaponDefinition {
     float recoil = 0.012f;
     bool automatic = false;
     glm::vec3 color{0.15f, 0.85f, 1.0f};
+    Rarity rarity = Rarity::Common;
+    const char* model = "";
 };
 
 struct WeaponState {
@@ -878,6 +1108,15 @@ struct Block {
     glm::vec3 size{1.0f};
     glm::vec4 color{1.0f};
     bool collision = true;
+    bool visible = true;
+};
+
+struct ModelPlacement {
+    int model = -1;
+    glm::vec3 position{};
+    glm::vec3 scale{1.0f};
+    float yaw = 0.0f;
+    glm::vec4 tint{1.0f};
 };
 
 struct Bot {
@@ -891,7 +1130,26 @@ struct Bot {
     float hitFlash = 0.0f;
     float muzzleFlash = 0.0f;
     float strafe = 1.0f;
+    float alertTimer = 0.0f;
+    float aimStability = 0.0f;
+    float animationTime = 0.0f;
+    glm::vec3 lastSeenPlayer{};
+    glm::vec3 tacticalGoal{};
+    std::vector<glm::vec3> path;
+    std::size_t pathCursor = 0;
+    int role = 0;
+    int burstShots = 0;
+    int model = 0;
     int type = 0;
+};
+
+struct Achievement {
+    const char* id = "";
+    const char* title = "";
+    const char* description = "";
+    int target = 1;
+    int progress = 0;
+    bool unlocked = false;
 };
 
 enum class PickupType { Health, Ammo };
@@ -925,18 +1183,51 @@ public:
     Game(Renderer& renderer, AudioEngine& audio)
         : renderer_(renderer), audio_(audio), cube_(makeCube()), cylinder_(makeCylinder()) {
         weaponDefinitions_ = {{
-            {"PISTOL", 12, 72, 30, 1, 0.28f, 1.05f, 0.0025f, 0.018f, false, {0.10f, 0.80f, 1.0f}},
-            {"RIFLE", 30, 180, 15, 1, 0.085f, 1.48f, 0.012f, 0.009f, true, {1.0f, 0.22f, 0.45f}},
-            {"SHOTGUN", 8, 48, 12, 8, 0.76f, 1.82f, 0.055f, 0.032f, false, {1.0f, 0.58f, 0.10f}},
-            {"SMG", 40, 240, 10, 1, 0.055f, 1.32f, 0.021f, 0.006f, true, {0.20f, 1.0f, 0.48f}},
-            {"DMR", 15, 90, 43, 1, 0.36f, 1.72f, 0.0038f, 0.021f, false, {0.72f, 0.24f, 1.0f}},
-            {"SNIPER", 5, 35, 92, 1, 0.95f, 2.15f, 0.0006f, 0.048f, false, {0.35f, 0.72f, 1.0f}}
+            {"V9 PISTOL", 12, 72, 30, 1, 0.28f, 1.05f, 0.0025f, 0.018f, false,
+             {0.72f, 0.76f, 0.82f}, Rarity::Common, "Guns/Quaternius/Pistol.glb"},
+            {"AR-4 RIFLE", 30, 180, 16, 1, 0.085f, 1.48f, 0.011f, 0.009f, true,
+             {0.18f, 0.92f, 0.38f}, Rarity::Uncommon, "Guns/Quaternius/Assault Rifle.glb"},
+            {"BREACH SHOTGUN", 8, 48, 13, 8, 0.76f, 1.82f, 0.052f, 0.032f, false,
+             {0.10f, 0.56f, 1.0f}, Rarity::Rare, "Guns/Quaternius/Shotgun.glb"},
+            {"VECTOR SMG", 40, 240, 11, 1, 0.055f, 1.32f, 0.020f, 0.006f, true,
+             {0.68f, 0.20f, 1.0f}, Rarity::Epic, "Guns/Quaternius/Submachine Gun.glb"},
+            {"BULLPUP DMR", 15, 90, 45, 1, 0.34f, 1.72f, 0.0035f, 0.021f, false,
+             {1.0f, 0.58f, 0.08f}, Rarity::Legendary, "Guns/Quaternius/Bullpup.glb"},
+            {"ORACLE SNIPER", 5, 35, 96, 1, 0.92f, 2.15f, 0.0005f, 0.048f, false,
+             {1.0f, 0.58f, 0.08f}, Rarity::Legendary, "Guns/Quaternius/Sniper Rifle.glb"},
+            {"NOVA BLASTER", 24, 144, 22, 1, 0.105f, 1.55f, 0.007f, 0.014f, true,
+             {1.0f, 0.08f, 0.38f}, Rarity::Mythic, "Guns/Blasters/blaster-a.glb"},
+            {"DRAGON CORE", 10, 60, 18, 6, 0.52f, 1.90f, 0.032f, 0.026f, false,
+             {1.0f, 0.22f, 0.04f}, Rarity::Mythic, "Guns/Blasters/blaster-f.glb"},
+            {"VOID CANNON", 6, 42, 72, 1, 0.68f, 2.05f, 0.0022f, 0.038f, false,
+             {0.78f, 0.10f, 1.0f}, Rarity::Mythic, "Guns/Blasters/blaster-p.glb"},
+            {"RAIL LANCER", 9, 54, 58, 1, 0.48f, 1.95f, 0.0012f, 0.030f, false,
+             {1.0f, 0.70f, 0.08f}, Rarity::Legendary, "Guns/Quaternius/Assault Rifle-Bgvuu4CUMV.glb"}
         }};
-        buildMap();
         const char* base = SDL_GetBasePath();
         const std::filesystem::path assetRoot = std::filesystem::path(base != nullptr ? base : "./") / "assets";
         helmet_.load(assetRoot / "SciFiHelmet" / "SciFiHelmet.gltf");
         bottle_.load(assetRoot / "WaterBottle.glb");
+        for (std::size_t i = 0; i < gunModels_.size(); ++i)
+            gunModels_[i].load(assetRoot / weaponDefinitions_[i].model);
+        for (std::size_t i = 0; i < operatorModels_.size(); ++i) {
+            const char variant = static_cast<char>('a' + static_cast<int>(i));
+            operatorModels_[i].load(assetRoot / "Characters" / (std::string("character-") + variant + ".glb"));
+        }
+        const std::array<const char*, 16> environmentPaths = {{
+            "Maps/Industrial/building-a.glb", "Maps/Industrial/building-b.glb",
+            "Maps/Industrial/building-c.glb", "Maps/Industrial/detail-tank.glb",
+            "Maps/Suburban/building-type-a.glb", "Maps/Suburban/building-type-b.glb",
+            "Maps/Suburban/building-type-c.glb", "Maps/Suburban/tree-large.glb",
+            "Maps/Roads/road-straight.glb", "Maps/Roads/road-crossroad.glb",
+            "Maps/SpaceStation/wall.glb", "Maps/SpaceStation/door-double-closed.glb",
+            "Maps/SpaceStation/computer-wide.glb", "Maps/SpaceStation/container-wide.glb",
+            "Maps/SpaceStation/structure.glb", "Maps/SpaceStation/table-display-planet.glb"
+        }};
+        for (std::size_t i = 0; i < environmentModels_.size(); ++i)
+            environmentModels_[i].load(assetRoot / environmentPaths[i]);
+        buildMap();
+        initializeAchievements();
         reset(false);
         mode_ = Mode::Title;
     }
@@ -970,9 +1261,17 @@ public:
                 if (event.key.scancode == SDL_SCANCODE_4) input.weaponPressed[3] = true;
                 if (event.key.scancode == SDL_SCANCODE_5) input.weaponPressed[4] = true;
                 if (event.key.scancode == SDL_SCANCODE_6) input.weaponPressed[5] = true;
+                if (event.key.scancode == SDL_SCANCODE_7) input.weaponPressed[6] = true;
+                if (event.key.scancode == SDL_SCANCODE_8) input.weaponPressed[7] = true;
+                if (event.key.scancode == SDL_SCANCODE_9) input.weaponPressed[8] = true;
+                if (event.key.scancode == SDL_SCANCODE_0) input.weaponPressed[9] = true;
                 if (event.key.scancode == SDL_SCANCODE_M) input.mapPressed = true;
                 if (event.key.scancode == SDL_SCANCODE_D) input.difficultyPressed = true;
                 if (event.key.scancode == SDL_SCANCODE_Q) input.qualityPressed = true;
+                if (event.key.scancode == SDL_SCANCODE_G) input.gameModePressed = true;
+                if (event.key.scancode == SDL_SCANCODE_C) input.operatorPressed = true;
+                if (event.key.scancode == SDL_SCANCODE_TAB) input.inventoryPressed = true;
+                if (event.key.scancode == SDL_SCANCODE_V) input.thirdPersonPressed = true;
                 break;
             default: break;
         }
@@ -981,10 +1280,11 @@ public:
     void update(float deltaTime, InputFrame& input) {
         time_ += deltaTime;
         deltaTime = std::min(deltaTime, 0.05f);
+        achievementPopupTimer_ = std::max(0.0f, achievementPopupTimer_ - deltaTime);
 
         if (mode_ == Mode::Title) {
             if (input.mapPressed) {
-                selectedMap_ = (selectedMap_ + 1) % 3;
+                selectedMap_ = (selectedMap_ + 1) % 6;
                 buildMap();
                 audio_.play(SoundEffect::Pickup);
             }
@@ -995,6 +1295,17 @@ public:
             if (input.qualityPressed) {
                 quality_ = (quality_ + 1) % 3;
                 audio_.play(SoundEffect::Pickup);
+            }
+            if (input.gameModePressed) {
+                gameMode_ = static_cast<GameMode>((static_cast<int>(gameMode_) + 1) % 4);
+                audio_.play(SoundEffect::Pickup);
+            }
+            if (input.operatorPressed) {
+                selectedOperator_ = (selectedOperator_ + 1) % static_cast<int>(operatorModels_.size());
+                audio_.play(SoundEffect::Pickup);
+            }
+            for (int i = 0; i < static_cast<int>(weapons_.size()); ++i) {
+                if (input.weaponPressed[static_cast<std::size_t>(i)]) switchWeapon(i);
             }
             if (input.confirmPressed || input.firePressed) {
                 reset(true);
@@ -1014,11 +1325,21 @@ public:
             }
             return;
         }
+        if (input.inventoryPressed) {
+            inventoryOpen_ = !inventoryOpen_;
+            audio_.play(SoundEffect::Pickup);
+        }
+        if (input.thirdPersonPressed) thirdPerson_ = !thirdPerson_;
         if (input.pausePressed) {
             mode_ = mode_ == Mode::Paused ? Mode::Playing : Mode::Paused;
             return;
         }
         if (mode_ == Mode::Paused) return;
+        if (inventoryOpen_) {
+            for (int i = 0; i < static_cast<int>(weapons_.size()); ++i)
+                if (input.weaponPressed[static_cast<std::size_t>(i)]) switchWeapon(i);
+            return;
+        }
 
         const bool* keys = SDL_GetKeyboardState(nullptr);
         updatePlayer(deltaTime, keys, input);
@@ -1055,6 +1376,11 @@ public:
         } else {
             eye = cameraPosition();
             forward = cameraForward();
+            if (thirdPerson_) {
+                const glm::vec3 target = playerPosition_ + glm::vec3(0.0f, 1.25f, 0.0f);
+                eye = target - forward * 5.4f + glm::vec3(0.0f, 1.85f, 0.0f);
+                forward = glm::normalize(target - eye);
+            }
         }
         const glm::mat4 view = glm::lookAt(eye, eye + forward, {0, 1, 0});
         const glm::mat4 projection = glm::perspective(glm::radians(72.0f),
@@ -1063,10 +1389,12 @@ public:
 
         renderWorld();
         renderPickups();
+        if (mode_ == Mode::Title) renderOperator({0.0f, 0.0f, 0.0f}, 0.0f, selectedOperator_, true);
+        else if (thirdPerson_) renderOperator(playerPosition_, yaw_, selectedOperator_, moving_);
         renderBots();
         renderParticles();
 
-        if (mode_ != Mode::Title) {
+        if (mode_ != Mode::Title && !thirdPerson_) {
             glClear(GL_DEPTH_BUFFER_BIT);
             renderWeapon(eye, forward);
         }
@@ -1074,7 +1402,7 @@ public:
         renderer_.flushUI();
     }
 
-    bool wantsMouseCapture() const { return mode_ == Mode::Playing; }
+    bool wantsMouseCapture() const { return mode_ == Mode::Playing && !inventoryOpen_; }
     bool quitRequested() const { return quitRequested_; }
     Mode mode() const { return mode_; }
 
@@ -1088,7 +1416,7 @@ private:
         score_ = 0;
         kills_ = 0;
         wave_ = 0;
-        selectedWeapon_ = 1;
+        if (!startWave) selectedWeapon_ = 1;
         weaponCooldown_ = 0.0f;
         reloadTimer_ = 0.0f;
         reloadWeapon_ = -1;
@@ -1101,20 +1429,33 @@ private:
             weapons_[i].loaded = weaponDefinitions_[i].magazine;
             weapons_[i].reserve = weaponDefinitions_[i].startingReserve;
         }
-        if (startWave) spawnWave();
+        inventoryOpen_ = false;
+        if (startWave) {
+            mapUsageMask_ |= (1u << static_cast<unsigned>(selectedMap_));
+            setAchievementProgress(6, std::popcount(mapUsageMask_ & 0x3fu));
+            spawnWave();
+        }
     }
 
     void buildMap() {
         blocks_.clear();
         spawnPoints_.clear();
-        auto add = [this](glm::vec3 center, glm::vec3 size, glm::vec4 color, bool collision = true) {
-            blocks_.push_back({center, size, color, collision});
+        modelPlacements_.clear();
+        auto add = [this](glm::vec3 center, glm::vec3 size, glm::vec4 color, bool collision = true,
+                          bool visible = true) {
+            blocks_.push_back({center, size, color, collision, visible});
         };
-        const std::array<glm::vec4, 3> floorColors = {{
-            {0.06f, 0.075f, 0.11f, 1}, {0.14f, 0.105f, 0.065f, 1}, {0.055f, 0.095f, 0.13f, 1}
+        auto addModel = [this](int model, glm::vec3 position, glm::vec3 scale, float yaw = 0.0f,
+                               glm::vec4 tint = glm::vec4(1.0f)) {
+            modelPlacements_.push_back({model, position, scale, yaw, tint});
+        };
+        const std::array<glm::vec4, 6> floorColors = {{
+            {0.06f, 0.075f, 0.11f, 1}, {0.14f, 0.105f, 0.065f, 1}, {0.055f, 0.095f, 0.13f, 1},
+            {0.075f, 0.10f, 0.075f, 1}, {0.035f, 0.055f, 0.085f, 1}, {0.09f, 0.075f, 0.065f, 1}
         }};
-        const std::array<glm::vec4, 3> wallColors = {{
-            {0.055f, 0.10f, 0.19f, 1}, {0.20f, 0.13f, 0.07f, 1}, {0.07f, 0.16f, 0.22f, 1}
+        const std::array<glm::vec4, 6> wallColors = {{
+            {0.055f, 0.10f, 0.19f, 1}, {0.20f, 0.13f, 0.07f, 1}, {0.07f, 0.16f, 0.22f, 1},
+            {0.10f, 0.14f, 0.10f, 1}, {0.075f, 0.10f, 0.16f, 1}, {0.15f, 0.11f, 0.07f, 1}
         }};
         add({0, -0.35f, 0}, {44, 0.7f, 44}, floorColors[static_cast<std::size_t>(selectedMap_)], false);
         const glm::vec4 wall = wallColors[static_cast<std::size_t>(selectedMap_)];
@@ -1163,7 +1504,7 @@ private:
                 {-18,0,-17}, {18,0,-17}, {-18,0,17}, {18,0,17}, {-12,0,0}, {12,0,0},
                 {-3,0,-16}, {3,0,16}, {-13,0,-8}, {13,0,8}, {-2,0,2}, {2,0,-2}
             }};
-        } else {
+        } else if (selectedMap_ == 2) {
             const glm::vec4 ice{0.04f, 0.31f, 0.43f, 1};
             const glm::vec4 lab{0.16f, 0.21f, 0.27f, 1};
             add({0, 1.1f, 0}, {6.0f, 2.2f, 6.0f}, lab);
@@ -1180,6 +1521,75 @@ private:
             spawnPoints_ = {{
                 {-18,0,-18}, {18,0,-18}, {-18,0,18}, {18,0,18}, {0,0,-18}, {0,0,18},
                 {-18,0,0}, {18,0,0}, {-6,0,-6}, {6,0,6}, {-6,0,6}, {6,0,-6}
+            }};
+        } else if (selectedMap_ == 3) {
+            const glm::vec4 hedge{0.08f, 0.20f, 0.09f, 1};
+            for (int x = -15; x <= 15; x += 10) {
+                for (int z = -15; z <= 15; z += 10) addModel(8, {static_cast<float>(x), 0.01f, static_cast<float>(z)}, {10,10,10});
+            }
+            addModel(9, {0, 0.02f, 0}, {10,10,10});
+            const std::array<glm::vec3, 6> homes = {{
+                {-15,0,-14}, {15,0,-14}, {-15,0,14}, {15,0,14}, {-15,0,0}, {15,0,0}
+            }};
+            for (std::size_t i = 0; i < homes.size(); ++i) {
+                const int homeModel = 4 + static_cast<int>(i % 3);
+                addModel(homeModel, homes[i], {7.2f,7.2f,7.2f}, i % 2 == 0 ? 0.0f : kPi);
+                add(homes[i] + glm::vec3(0,2.7f,0), {8.8f,5.4f,7.0f}, wall, true,
+                    !environmentModels_[static_cast<std::size_t>(homeModel)].valid());
+            }
+            for (const glm::vec3 tree : std::array<glm::vec3, 8>{{
+                     {-8,0,-17}, {8,0,-17}, {-8,0,17}, {8,0,17}, {-18,0,-7}, {18,0,7}, {-4,0,5}, {5,0,-5}}}) {
+                addModel(7, tree, {3.2f,3.2f,3.2f});
+                add(tree + glm::vec3(0,1.0f,0), {1.1f,2.0f,1.1f}, hedge, true,
+                    !environmentModels_[7].valid());
+            }
+            add({0,0.8f,-8}, {7.0f,1.6f,1.0f}, hedge);
+            add({0,0.8f,8}, {7.0f,1.6f,1.0f}, hedge);
+            spawnPoints_ = {{
+                {-19,0,-19}, {19,0,-19}, {-19,0,19}, {19,0,19}, {-9,0,-13}, {9,0,13},
+                {-10,0,2}, {10,0,-2}, {-2,0,-17}, {2,0,17}, {-17,0,7}, {17,0,-7}
+            }};
+        } else if (selectedMap_ == 4) {
+            const glm::vec4 station{0.11f, 0.15f, 0.23f, 1};
+            add({0,1.5f,0}, {5.5f,3.0f,5.5f}, station);
+            for (int side = -1; side <= 1; side += 2) {
+                add({side * 10.5f,1.4f,0}, {2.0f,2.8f,13.0f}, station);
+                add({0,1.4f,side * 10.5f}, {13.0f,2.8f,2.0f}, station);
+                addModel(10, {side * 20.5f,0.0f,0}, {4.0f,4.0f,4.0f}, kPi * 0.5f);
+                addModel(10, {0,0.0f,side * 20.5f}, {4.0f,4.0f,4.0f});
+                addModel(11, {side * 3.0f,0.0f,0}, {2.2f,2.2f,2.2f}, kPi * 0.5f);
+                addModel(13, {side * 15.0f,0.0f,side * 7.0f}, {2.4f,2.4f,2.4f});
+            }
+            addModel(15, {0,0.0f,0}, {2.6f,2.6f,2.6f});
+            addModel(12, {-7.5f,0.0f,-15.0f}, {2.5f,2.5f,2.5f}, kPi);
+            addModel(12, {7.5f,0.0f,15.0f}, {2.5f,2.5f,2.5f});
+            spawnPoints_ = {{
+                {-18,0,-18}, {18,0,-18}, {-18,0,18}, {18,0,18}, {-15,0,0}, {15,0,0},
+                {0,0,-15}, {0,0,15}, {-7,0,-7}, {7,0,7}, {-7,0,7}, {7,0,-7}
+            }};
+        } else {
+            const glm::vec4 rust{0.30f,0.12f,0.035f,1};
+            const std::array<glm::vec3, 6> factories = {{
+                {-15,0,-15}, {15,0,-15}, {-15,0,15}, {15,0,15}, {-16,0,0}, {16,0,0}
+            }};
+            for (std::size_t i = 0; i < factories.size(); ++i) {
+                const int factoryModel = static_cast<int>(i % 3);
+                addModel(factoryModel, factories[i], {6.0f,6.0f,6.0f}, i % 2 ? kPi : 0.0f);
+                add(factories[i] + glm::vec3(0,3.6f,0), {10.0f,7.2f,7.0f}, wall, true,
+                    !environmentModels_[static_cast<std::size_t>(factoryModel)].valid());
+            }
+            for (const glm::vec3 tank : std::array<glm::vec3, 6>{{
+                     {-7,0,-9}, {7,0,9}, {8,0,-8}, {-8,0,8}, {0,0,-16}, {0,0,16}}}) {
+                addModel(3, tank, {4.0f,4.0f,4.0f});
+                add(tank + glm::vec3(0,1.1f,0), {2.5f,2.2f,2.5f}, rust, true,
+                    !environmentModels_[3].valid());
+            }
+            add({0,0.9f,0}, {7.0f,1.8f,2.4f}, rust);
+            add({0,0.9f,-7}, {2.4f,1.8f,6.0f}, rust);
+            add({0,0.9f,7}, {2.4f,1.8f,6.0f}, rust);
+            spawnPoints_ = {{
+                {-19,0,-19}, {19,0,-19}, {-19,0,19}, {19,0,19}, {-12,0,-5}, {12,0,5},
+                {-5,0,-12}, {5,0,12}, {-15,0,8}, {15,0,-8}, {-3,0,3}, {3,0,-3}
             }};
         }
     }
@@ -1222,6 +1632,7 @@ private:
     }
 
     void updatePlayer(float deltaTime, const bool* keys, const InputFrame& input) {
+        const glm::vec3 previousPosition = playerPosition_;
         yaw_ += input.mouseX * 0.0021f;
         pitch_ -= input.mouseY * 0.0021f;
         pitch_ = glm::clamp(pitch_, -1.42f, 1.42f);
@@ -1253,6 +1664,7 @@ private:
             playerVerticalVelocity_ = 0.0f;
             onGround_ = true;
         }
+        playerVelocity_ = (playerPosition_ - previousPosition) / std::max(deltaTime, 0.001f);
     }
 
     void switchWeapon(int index) {
@@ -1310,6 +1722,8 @@ private:
         }
 
         --state.loaded;
+        weaponUsageMask_ |= (1u << static_cast<unsigned>(selectedWeapon_));
+        if ((weaponUsageMask_ & 0x3ffu) == 0x3ffu) setAchievementProgress(4, 10);
         weaponCooldown_ = definition.interval;
         muzzleFlash_ = 1.0f;
         weaponKick_ = 1.0f;
@@ -1318,6 +1732,14 @@ private:
         else if (selectedWeapon_ == 2) audio_.play(SoundEffect::Shotgun);
         else if (selectedWeapon_ == 5) audio_.play(SoundEffect::Shotgun);
         else audio_.play(SoundEffect::Rifle);
+
+        for (Bot& bot : bots_) {
+            const float hearingDistance = definition.rarity == Rarity::Mythic ? 42.0f : 30.0f;
+            if (glm::distance(bot.position, playerPosition_) < hearingDistance) {
+                bot.lastSeenPlayer = playerPosition_;
+                bot.alertTimer = std::max(bot.alertTimer, 4.0f);
+            }
+        }
 
         const glm::vec3 origin = cameraPosition();
         const glm::vec3 forward = cameraForward();
@@ -1383,15 +1805,40 @@ private:
         if (bot.health > 0.0f) return {true, false};
 
         const glm::vec3 deathPosition = bot.position + glm::vec3(0, 0.8f, 0);
-        const int deathParticles = quality_ == 0 ? 7 : (quality_ == 1 ? 12 : 18);
+        const Rarity killRarity = weaponDefinitions_[static_cast<std::size_t>(selectedWeapon_)].rarity;
+        const int rarityBonus = killRarity == Rarity::Mythic ? 12 : (killRarity == Rarity::Legendary ? 6 : 0);
+        const int deathParticles = (quality_ == 0 ? 7 : (quality_ == 1 ? 12 : 18)) + rarityBonus;
+        const glm::vec4 killColor = rarityColor(killRarity);
         for (int i = 0; i < deathParticles; ++i) {
-            particles_.push_back({deathPosition, randomUnit() * randomRange(1.5f, 5.0f),
-                                  {1.0f, 0.06f, 0.25f, 1.0f}, randomRange(0.35f, 0.8f), 0.8f,
+            glm::vec4 color = killRarity == Rarity::Mythic && i % 3 == 0
+                ? glm::vec4(0.12f,0.85f,1.0f,1.0f) : killColor;
+            glm::vec3 velocity = randomUnit() * randomRange(1.5f, killRarity == Rarity::Mythic ? 7.2f : 5.0f);
+            if (killRarity == Rarity::Legendary && i % 2 == 0) velocity.y = std::abs(velocity.y) + 2.0f;
+            particles_.push_back({deathPosition, velocity, color, randomRange(0.35f, 0.95f), 0.95f,
                                   randomRange(0.025f, 0.075f)});
+        }
+        if (killRarity == Rarity::Mythic) {
+            for (int ray = 0; ray < 10; ++ray) {
+                const float angle = static_cast<float>(ray) / 10.0f * kPi * 2.0f;
+                const glm::vec3 direction{std::cos(angle), 0.18f, std::sin(angle)};
+                tracers_.push_back({deathPosition, deathPosition + direction * 3.2f,
+                                    ray % 2 == 0 ? killColor : glm::vec4(0.12f,0.85f,1.0f,0.9f), 0.22f});
+            }
         }
         bots_.erase(bots_.begin() + hitBot);
         ++kills_;
+        if (headshot) {
+            ++headshots_;
+            incrementAchievement(1);
+        }
+        incrementAchievement(0);
+        incrementAchievement(2);
+        if (weaponDefinitions_[static_cast<std::size_t>(selectedWeapon_)].rarity == Rarity::Mythic) {
+            ++mythicKills_;
+            incrementAchievement(5);
+        }
         score_ += 100 + wave_ * 25 + (headshot ? 75 : 0);
+        setAchievementProgress(7, score_);
         if (kills_ % 4 == 0) {
             pickups_.push_back({deathPosition - glm::vec3(0, 0.8f, 0),
                                 playerHealth_ < 55.0f ? PickupType::Health : PickupType::Ammo, randomRange(0, kPi)});
@@ -1416,21 +1863,31 @@ private:
     void spawnWave() {
         ++wave_;
         const int botLimit = quality_ == 0 ? 11 : (quality_ == 1 ? 15 : 19);
-        const int count = std::min(3 + wave_ * 2, botLimit);
+        int requested = 3 + wave_ * 2;
+        if (gameMode_ == GameMode::Elimination) requested = 8 + std::min(wave_, 4);
+        else if (gameMode_ == GameMode::HeadHunter) requested = 4 + wave_;
+        else if (gameMode_ == GameMode::Mayhem) requested = 7 + wave_ * 3;
+        const int count = std::min(requested, gameMode_ == GameMode::Mayhem ? botLimit + 4 : botLimit);
         const std::array<float, 3> healthScale = {{0.82f, 1.0f, 1.24f}};
         std::shuffle(spawnPoints_.begin(), spawnPoints_.end(), random_);
         for (int i = 0; i < count; ++i) {
             Bot bot;
             bot.position = spawnPoints_[static_cast<std::size_t>(i % spawnPoints_.size())];
             if (i >= static_cast<int>(spawnPoints_.size())) bot.position += randomUnitFlat() * randomRange(0.8f, 2.3f);
-            bot.type = (wave_ >= 3 && i % 5 == 0) ? 1 : 0;
+            bot.type = (wave_ >= 3 && i % 5 == 0) || gameMode_ == GameMode::HeadHunter ? 1 : 0;
+            bot.role = i % 4;
+            bot.model = (i + wave_) % static_cast<int>(operatorModels_.size());
             bot.maxHealth = ((bot.type == 1 ? 150.0f : 82.0f) + wave_ * 11.0f) *
                             healthScale[static_cast<std::size_t>(difficulty_)];
+            if (gameMode_ == GameMode::HeadHunter) bot.maxHealth *= 1.18f;
             bot.health = bot.maxHealth;
             bot.fireTimer = randomRange(0.45f, 1.8f);
             bot.strafe = randomRange(0.0f, 1.0f) > 0.5f ? 1.0f : -1.0f;
+            bot.lastSeenPlayer = playerPosition_;
+            bot.tacticalGoal = playerPosition_;
             bots_.push_back(bot);
         }
+        setAchievementProgress(3, wave_);
         nextWaveTimer_ = 999.0f;
         audio_.play(SoundEffect::Start);
     }
@@ -1448,6 +1905,129 @@ private:
         return true;
     }
 
+    std::vector<glm::vec3> findPath(const glm::vec3& start, const glm::vec3& goal) const {
+        constexpr int gridSize = 29;
+        constexpr float cellSize = 1.5f;
+        constexpr float origin = -21.0f;
+        constexpr int cellCount = gridSize * gridSize;
+        const auto cell = [](const glm::vec3& value) {
+            return std::pair{
+                glm::clamp(static_cast<int>(std::round((value.x - origin) / cellSize)), 1, gridSize - 2),
+                glm::clamp(static_cast<int>(std::round((value.z - origin) / cellSize)), 1, gridSize - 2)};
+        };
+        const auto world = [](int x, int z) {
+            return glm::vec3(origin + static_cast<float>(x) * cellSize, 0.0f,
+                             origin + static_cast<float>(z) * cellSize);
+        };
+        const auto index = [](int x, int z) { return z * gridSize + x; };
+        const auto [startX, startZ] = cell(start);
+        auto [goalX, goalZ] = cell(goal);
+        if (pointBlocked(world(goalX, goalZ), 0.46f)) {
+            bool found = false;
+            for (int radius = 1; radius <= 5 && !found; ++radius) {
+                for (int dz = -radius; dz <= radius && !found; ++dz) {
+                    for (int dx = -radius; dx <= radius; ++dx) {
+                        const int x = glm::clamp(goalX + dx, 1, gridSize - 2);
+                        const int z = glm::clamp(goalZ + dz, 1, gridSize - 2);
+                        if (!pointBlocked(world(x, z), 0.46f)) {
+                            goalX = x; goalZ = z; found = true; break;
+                        }
+                    }
+                }
+            }
+        }
+
+        struct OpenCell {
+            float score = 0.0f;
+            int index = 0;
+            bool operator<(const OpenCell& other) const { return score > other.score; }
+        };
+        std::priority_queue<OpenCell> open;
+        std::array<float, cellCount> cost{};
+        std::array<int, cellCount> parent{};
+        std::array<bool, cellCount> closed{};
+        cost.fill(std::numeric_limits<float>::max());
+        parent.fill(-1);
+        const int startIndex = index(startX, startZ);
+        const int goalIndex = index(goalX, goalZ);
+        cost[static_cast<std::size_t>(startIndex)] = 0.0f;
+        open.push({0.0f, startIndex});
+        static constexpr std::array<std::pair<int,int>, 8> directions = {{
+            {-1,0}, {1,0}, {0,-1}, {0,1}, {-1,-1}, {-1,1}, {1,-1}, {1,1}
+        }};
+        while (!open.empty()) {
+            const int current = open.top().index;
+            open.pop();
+            if (closed[static_cast<std::size_t>(current)]) continue;
+            closed[static_cast<std::size_t>(current)] = true;
+            if (current == goalIndex) break;
+            const int currentX = current % gridSize;
+            const int currentZ = current / gridSize;
+            for (const auto& [dx, dz] : directions) {
+                const int x = currentX + dx;
+                const int z = currentZ + dz;
+                if (x <= 0 || z <= 0 || x >= gridSize - 1 || z >= gridSize - 1) continue;
+                const int next = index(x, z);
+                if (closed[static_cast<std::size_t>(next)] || pointBlocked(world(x, z), 0.46f)) continue;
+                const float step = dx != 0 && dz != 0 ? 1.4142f : 1.0f;
+                const float nextCost = cost[static_cast<std::size_t>(current)] + step;
+                if (nextCost >= cost[static_cast<std::size_t>(next)]) continue;
+                cost[static_cast<std::size_t>(next)] = nextCost;
+                parent[static_cast<std::size_t>(next)] = current;
+                const float heuristic = std::hypot(static_cast<float>(goalX - x), static_cast<float>(goalZ - z));
+                open.push({nextCost + heuristic, next});
+            }
+        }
+
+        std::vector<glm::vec3> result;
+        if (goalIndex != startIndex && parent[static_cast<std::size_t>(goalIndex)] < 0) return result;
+        for (int current = goalIndex; current != startIndex && current >= 0;
+             current = parent[static_cast<std::size_t>(current)]) {
+            result.push_back(world(current % gridSize, current / gridSize));
+        }
+        std::reverse(result.begin(), result.end());
+        return result;
+    }
+
+    glm::vec3 findCoverPoint(const Bot& bot) const {
+        glm::vec3 best = bot.position;
+        float bestDistance = std::numeric_limits<float>::max();
+        for (const Block& block : blocks_) {
+            if (!block.collision || block.size.y < 1.0f) continue;
+            glm::vec3 away = block.center - playerPosition_;
+            away.y = 0.0f;
+            if (glm::length2(away) < 0.01f) continue;
+            away = glm::normalize(away);
+            const float clearance = std::max(block.size.x, block.size.z) * 0.5f + 0.85f;
+            const glm::vec3 candidate = glm::vec3(block.center.x, 0.0f, block.center.z) + away * clearance;
+            const float distance = glm::distance(candidate, bot.position);
+            if (distance > 17.0f || distance >= bestDistance || pointBlocked(candidate, 0.48f)) continue;
+            if (!lineOfSight(candidate + glm::vec3(0,1.25f,0), cameraPosition())) {
+                best = candidate;
+                bestDistance = distance;
+            }
+        }
+        return best;
+    }
+
+    glm::vec3 chooseTacticalGoal(const Bot& bot, bool visible, float distance,
+                                 const glm::vec3& flatDirection) const {
+        if (bot.health < bot.maxHealth * 0.30f) {
+            const glm::vec3 cover = findCoverPoint(bot);
+            if (glm::distance2(cover, bot.position) > 0.5f) return cover;
+        }
+        if (!visible && bot.alertTimer > 0.0f) return bot.lastSeenPlayer;
+        const glm::vec3 side{-flatDirection.z, 0.0f, flatDirection.x};
+        switch (bot.role) {
+            case 1: return playerPosition_ + side * bot.strafe * 8.5f - flatDirection * 2.5f;
+            case 2: return distance < 12.0f ? bot.position - flatDirection * 6.0f
+                                           : playerPosition_ - flatDirection * 13.5f + side * bot.strafe * 3.0f;
+            case 3: return playerPosition_ - flatDirection * 2.2f;
+            default: return distance > 8.0f ? playerPosition_ - flatDirection * 6.5f
+                                            : bot.position + side * bot.strafe * 3.0f;
+        }
+    }
+
     void updateBots(float deltaTime) {
         const glm::vec3 playerTarget = cameraPosition() - glm::vec3(0, 0.35f, 0);
         for (Bot& bot : bots_) {
@@ -1455,27 +2035,51 @@ private:
             bot.decisionTimer -= deltaTime;
             bot.hitFlash = std::max(0.0f, bot.hitFlash - deltaTime * 5.0f);
             bot.muzzleFlash = std::max(0.0f, bot.muzzleFlash - deltaTime * 9.0f);
+            bot.alertTimer = std::max(0.0f, bot.alertTimer - deltaTime);
+            bot.animationTime += deltaTime * (glm::length2(bot.velocity) > 1.0f ? 1.35f : 1.0f);
             const glm::vec3 from = bot.position + glm::vec3(0, 1.32f, 0);
             glm::vec3 toPlayer = playerTarget - from;
             const float distance = glm::length(toPlayer);
             const glm::vec3 direction = distance > 0.01f ? toPlayer / distance : glm::vec3(0, 0, 1);
             const bool visible = lineOfSight(from, playerTarget);
-
-            if (bot.decisionTimer <= 0.0f) {
-                bot.decisionTimer = randomRange(0.55f, 1.5f);
-                if (randomRange(0, 1) > 0.62f) bot.strafe *= -1.0f;
+            if (visible) {
+                bot.lastSeenPlayer = playerPosition_;
+                bot.alertTimer = 5.0f;
+                bot.aimStability = std::min(1.0f, bot.aimStability + deltaTime * (0.7f + difficulty_ * 0.18f));
+            } else {
+                bot.aimStability = std::max(0.0f, bot.aimStability - deltaTime * 0.85f);
             }
 
             glm::vec3 flatDirection = glm::normalize(glm::vec3(direction.x, 0.0f, direction.z));
             if (!std::isfinite(flatDirection.x)) flatDirection = {0, 0, 1};
             const glm::vec3 side{-flatDirection.z, 0.0f, flatDirection.x};
+
+            if (bot.decisionTimer <= 0.0f) {
+                bot.decisionTimer = randomRange(0.42f, 0.95f) - difficulty_ * 0.06f;
+                if (randomRange(0, 1) > 0.66f) bot.strafe *= -1.0f;
+                bot.tacticalGoal = chooseTacticalGoal(bot, visible, distance, flatDirection);
+                bot.path = findPath(bot.position, bot.tacticalGoal);
+                bot.pathCursor = 0;
+            }
+
             glm::vec3 desired(0.0f);
-            if (!visible || distance > 10.5f) desired += flatDirection;
-            else if (distance < 4.2f) desired -= flatDirection * 0.85f;
-            if (visible && distance < 16.0f) desired += side * bot.strafe * 0.72f;
+            while (bot.pathCursor < bot.path.size() &&
+                   glm::distance2(bot.position, bot.path[bot.pathCursor]) < 0.75f * 0.75f) ++bot.pathCursor;
+            if (bot.pathCursor < bot.path.size()) {
+                glm::vec3 pathDirection = bot.path[bot.pathCursor] - bot.position;
+                pathDirection.y = 0.0f;
+                if (glm::length2(pathDirection) > 0.01f) desired += glm::normalize(pathDirection);
+            } else if (bot.alertTimer > 0.0f || visible) {
+                glm::vec3 goalDirection = bot.tacticalGoal - bot.position;
+                goalDirection.y = 0.0f;
+                if (glm::length2(goalDirection) > 1.0f) desired += glm::normalize(goalDirection);
+            }
+            if (visible && distance < 18.0f) desired += side * bot.strafe * (bot.role == 1 ? 1.05f : 0.48f);
+            if (visible && distance < (bot.role == 3 ? 2.5f : 4.0f)) desired -= flatDirection;
             if (glm::length2(desired) > 0.01f) desired = glm::normalize(desired);
-            const float speed = (bot.type == 1 ? 2.25f : 3.15f) + std::min(wave_ * 0.08f, 0.8f) +
-                                difficulty_ * 0.22f;
+            const float roleSpeed = bot.role == 1 ? 0.45f : (bot.role == 3 ? 0.70f : 0.0f);
+            const float speed = (bot.type == 1 ? 2.35f : 3.15f) + roleSpeed +
+                                std::min(wave_ * 0.08f, 0.8f) + difficulty_ * 0.22f;
             glm::vec3 moved = moveWithCollision(bot.position, desired * speed * deltaTime, bot.type == 1 ? 0.56f : 0.43f);
             if (glm::length2(moved - bot.position) < 0.00001f) {
                 moved = moveWithCollision(bot.position, side * bot.strafe * speed * deltaTime, 0.43f);
@@ -1485,19 +2089,26 @@ private:
             bot.position = moved;
             bot.yaw = std::atan2(direction.x, direction.z);
 
-            if (visible && distance < 28.0f && bot.fireTimer <= 0.0f) {
-                const float fireRate = bot.type == 1 ? 0.55f : 0.88f;
-                bot.fireTimer = std::max(0.28f, fireRate - wave_ * 0.018f) + randomRange(0.0f, 0.34f);
+            const float reactionThreshold = 0.58f - difficulty_ * 0.12f + (bot.role == 2 ? -0.08f : 0.0f);
+            if (visible && distance < 30.0f && bot.fireTimer <= 0.0f && bot.aimStability >= reactionThreshold) {
+                if (bot.burstShots <= 0) bot.burstShots = bot.role == 2 ? 1 : static_cast<int>(randomRange(2.0f, 5.8f));
+                --bot.burstShots;
+                const float fireRate = bot.type == 1 ? 0.52f : 0.78f;
+                bot.fireTimer = bot.burstShots > 0 ? randomRange(0.10f, 0.18f)
+                    : std::max(0.26f, fireRate - wave_ * 0.016f) + randomRange(0.08f, 0.30f);
                 bot.muzzleFlash = 1.0f;
                 audio_.play(SoundEffect::Enemy);
-                const float accuracy = glm::clamp(0.34f + difficulty_ * 0.10f + wave_ * 0.018f -
-                                                  distance * 0.008f, 0.14f, 0.84f);
+                const float accuracy = glm::clamp(0.25f + bot.aimStability * 0.36f + difficulty_ * 0.09f +
+                                                  wave_ * 0.012f + (bot.role == 2 ? 0.12f : 0.0f) -
+                                                  distance * 0.007f, 0.14f, 0.90f);
                 const bool hit = randomRange(0, 1) < accuracy;
-                glm::vec3 end = playerTarget;
+                const float leadTime = glm::clamp(distance / 90.0f, 0.04f, 0.22f);
+                glm::vec3 end = playerTarget + playerVelocity_ * leadTime;
                 if (!hit) end += randomUnit() * randomRange(0.8f, 2.5f);
                 tracers_.push_back({from + direction * 0.35f, end, {1.0f, 0.08f, 0.22f, 0.8f}, 0.09f});
                 if (hit) {
-                    const float damage = ((bot.type == 1 ? 12.0f : 7.0f) + wave_ * 0.35f) *
+                    const float roleDamage = bot.role == 2 ? 3.0f : (bot.role == 3 ? -1.0f : 0.0f);
+                    const float damage = ((bot.type == 1 ? 12.0f : 7.0f) + roleDamage + wave_ * 0.35f) *
                                          (0.78f + difficulty_ * 0.22f);
                     playerHealth_ -= damage;
                     damageFlash_ = 1.0f;
@@ -1564,7 +2175,16 @@ private:
     }
 
     void renderWorld() {
-        for (const Block& block : blocks_) renderer_.draw(cube_, modelMatrix(block.center, block.size), block.color);
+        for (const Block& block : blocks_) {
+            if (block.visible) renderer_.draw(cube_, modelMatrix(block.center, block.size), block.color);
+        }
+        for (const ModelPlacement& placement : modelPlacements_) {
+            if (placement.model < 0 || placement.model >= static_cast<int>(environmentModels_.size())) continue;
+            const glm::mat4 transform = glm::translate(glm::mat4(1.0f), placement.position) *
+                glm::rotate(glm::mat4(1.0f), placement.yaw, glm::vec3(0,1,0)) *
+                glm::scale(glm::mat4(1.0f), placement.scale);
+            environmentModels_[static_cast<std::size_t>(placement.model)].draw(renderer_, transform, placement.tint);
+        }
 
         const glm::vec4 lineColor{0.01f, 0.24f, 0.34f, 1.0f};
         const int gridStep = quality_ == 0 ? 4 : 2;
@@ -1601,6 +2221,27 @@ private:
         }
     }
 
+    void renderOperator(const glm::vec3& position, float yaw, int modelIndex, bool moving) {
+        if (modelIndex < 0 || modelIndex >= static_cast<int>(operatorModels_.size())) return;
+        GltfModel& model = operatorModels_[static_cast<std::size_t>(modelIndex)];
+        if (!model.valid()) return;
+        const int animation = model.findAnimation(moving ? "sprint" : "idle");
+        const glm::mat4 root = glm::translate(glm::mat4(1.0f), position) *
+            glm::rotate(glm::mat4(1.0f), yaw, glm::vec3(0,1,0)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(0.205f));
+        model.drawAnimated(renderer_, root, animation, time_);
+
+        if (selectedWeapon_ >= 0 && selectedWeapon_ < static_cast<int>(gunModels_.size()) &&
+            gunModels_[static_cast<std::size_t>(selectedWeapon_)].valid()) {
+            const glm::mat4 gun = glm::translate(glm::mat4(1.0f), position) *
+                glm::rotate(glm::mat4(1.0f), yaw, glm::vec3(0,1,0)) *
+                glm::translate(glm::mat4(1.0f), {0.28f, 1.25f, 0.42f}) *
+                glm::rotate(glm::mat4(1.0f), -kPi * 0.5f, glm::vec3(0,1,0)) *
+                glm::scale(glm::mat4(1.0f), glm::vec3(0.20f));
+            gunModels_[static_cast<std::size_t>(selectedWeapon_)].draw(renderer_, gun);
+        }
+    }
+
     void renderBots() {
         for (const Bot& bot : bots_) {
             const float healthRatio = saturate(bot.health / bot.maxHealth);
@@ -1609,6 +2250,34 @@ private:
             suit = glm::mix(suit, glm::vec4(1,1,1,1), bot.hitFlash * 0.75f);
             const glm::mat4 bodyRoot = glm::translate(glm::mat4(1), bot.position) *
                                        glm::rotate(glm::mat4(1), bot.yaw, glm::vec3(0,1,0));
+            const std::size_t modelIndex = static_cast<std::size_t>(bot.model % static_cast<int>(operatorModels_.size()));
+            if (operatorModels_[modelIndex].valid()) {
+                const bool running = glm::length2(bot.velocity) > 1.0f;
+                const int animation = operatorModels_[modelIndex].findAnimation(
+                    bot.muzzleFlash > 0.0f ? "holding-both-shoot" : (running ? "sprint" : "holding-both"));
+                const float bodyScale = bot.type == 1 ? 0.235f : 0.205f;
+                const glm::mat4 animatedRoot = bodyRoot * glm::scale(glm::mat4(1.0f), glm::vec3(bodyScale));
+                operatorModels_[modelIndex].drawAnimated(renderer_, animatedRoot, animation, bot.animationTime, suit);
+
+                const int botWeapon = bot.role == 2 ? 5 : (bot.role == 1 ? 3 : 1);
+                if (gunModels_[static_cast<std::size_t>(botWeapon)].valid()) {
+                    const glm::mat4 gun = bodyRoot * glm::translate(glm::mat4(1.0f), {0.25f,1.25f,0.42f}) *
+                        glm::rotate(glm::mat4(1.0f), -kPi * 0.5f, glm::vec3(0,1,0)) *
+                        glm::scale(glm::mat4(1.0f), glm::vec3(0.20f));
+                    gunModels_[static_cast<std::size_t>(botWeapon)].draw(renderer_, gun);
+                }
+                if (bot.muzzleFlash > 0) {
+                    renderer_.draw(cube_, bodyRoot * glm::translate(glm::mat4(1), {0.25f,1.25f,1.05f}) *
+                                   glm::scale(glm::mat4(1), glm::vec3(0.10f + bot.muzzleFlash * 0.11f)),
+                                   {1.0f,0.08f,0.15f,1}, 0, 3.0f);
+                }
+                renderer_.draw(cube_, modelMatrix(bot.position + glm::vec3(0, 2.05f, 0), {0.82f, 0.055f, 0.055f}),
+                               {0.04f,0.04f,0.055f,1});
+                renderer_.draw(cube_, modelMatrix(bot.position + glm::vec3(-0.41f + 0.41f * healthRatio, 2.052f, 0.002f),
+                                                   {0.82f * healthRatio, 0.06f, 0.06f}),
+                               healthRatio > 0.45f ? glm::vec4(0.1f,0.95f,0.45f,1) : glm::vec4(1,0.12f,0.16f,1), 0, 0.8f);
+                continue;
+            }
             renderer_.draw(cube_, bodyRoot * glm::translate(glm::mat4(1), {0, 0.92f, 0}) *
                            glm::scale(glm::mat4(1), bot.type == 1 ? glm::vec3(0.75f, 1.08f, 0.46f)
                                                                  : glm::vec3(0.58f, 0.92f, 0.38f)), suit);
@@ -1676,6 +2345,37 @@ private:
         const glm::vec4 dark{0.025f, 0.032f, 0.052f, 1};
         const glm::vec4 glow{accent, 1};
 
+        if (selectedWeapon_ >= 0 && selectedWeapon_ < static_cast<int>(gunModels_.size()) &&
+            gunModels_[static_cast<std::size_t>(selectedWeapon_)].valid()) {
+            glm::mat4 weaponTransform = root;
+            float muzzleLength = 1.15f;
+            if (selectedWeapon_ >= 6 && selectedWeapon_ <= 8) {
+                weaponTransform *= glm::translate(glm::mat4(1.0f), {0.0f,-0.02f,0.48f}) *
+                    glm::scale(glm::mat4(1.0f), glm::vec3(0.92f));
+                muzzleLength = selectedWeapon_ == 7 ? 1.42f : 1.12f;
+            } else {
+                weaponTransform *= glm::translate(glm::mat4(1.0f), {0.0f,-0.02f,0.18f}) *
+                    glm::rotate(glm::mat4(1.0f), -kPi * 0.5f, glm::vec3(0,1,0)) *
+                    glm::scale(glm::mat4(1.0f), glm::vec3(0.22f));
+                muzzleLength = selectedWeapon_ == 0 ? 0.82f : (selectedWeapon_ == 5 ? 1.48f : 1.18f);
+            }
+            gunModels_[static_cast<std::size_t>(selectedWeapon_)].draw(renderer_, weaponTransform);
+            const Rarity rarity = weaponDefinitions_[static_cast<std::size_t>(selectedWeapon_)].rarity;
+            if (rarity == Rarity::Legendary || rarity == Rarity::Mythic) {
+                renderer_.draw(cube_, root * glm::translate(glm::mat4(1.0f), {0.0f,0.10f,0.48f}) *
+                               glm::scale(glm::mat4(1.0f), {0.025f,0.025f,0.55f}),
+                               rarityColor(rarity), 0, rarity == Rarity::Mythic ? 2.8f : 1.3f);
+            }
+            if (muzzleFlash_ > 0.0f) {
+                const glm::vec4 flash = rarity == Rarity::Mythic ? rarityColor(rarity)
+                                                                 : glm::vec4(1.0f,0.42f,0.04f,1.0f);
+                renderer_.draw(cube_, root * glm::translate(glm::mat4(1.0f), {0,0,muzzleLength}) *
+                               glm::scale(glm::mat4(1.0f), glm::vec3(0.11f + muzzleFlash_ * 0.12f)),
+                               flash, 0, rarity == Rarity::Mythic ? 6.0f : 4.0f);
+            }
+            return;
+        }
+
         if (selectedWeapon_ == 0) {
             renderer_.draw(cube_, root * glm::translate(glm::mat4(1), {0,0,0.18f}) *
                            glm::scale(glm::mat4(1), {0.18f,0.16f,0.52f}), dark);
@@ -1717,6 +2417,75 @@ private:
         }
     }
 
+    void initializeAchievements() {
+        achievements_ = {{
+            {"first_blood", "FIRST BLOOD", "Eliminate one hostile", 1},
+            {"headhunter", "HEAD HUNTER", "Land 10 lethal headshots", 10},
+            {"terminator", "TERMINATOR", "Eliminate 25 hostiles", 25},
+            {"wavebreaker", "WAVEBREAKER", "Reach wave five", 5},
+            {"arsenal", "FULL ARSENAL", "Fire every weapon", 10},
+            {"mythic", "MYTHIC EXECUTIONER", "Get 10 Mythic eliminations", 10},
+            {"world_tour", "WORLD TOUR", "Deploy to every map", 6},
+            {"high_score", "NEON LEGEND", "Score 5000 in one run", 5000}
+        }};
+        char* preferenceDirectory = SDL_GetPrefPath("DeathAmir", "NeonAssault");
+        if (preferenceDirectory != nullptr) {
+            progressPath_ = std::filesystem::path(preferenceDirectory) / "achievements.txt";
+            SDL_free(preferenceDirectory);
+        } else {
+            progressPath_ = "achievements.txt";
+        }
+        std::ifstream input(progressPath_);
+        std::string id;
+        int progress = 0;
+        int unlocked = 0;
+        while (input >> id >> progress >> unlocked) {
+            for (Achievement& achievement : achievements_) {
+                if (id == achievement.id) {
+                    achievement.progress = glm::clamp(progress, 0, achievement.target);
+                    achievement.unlocked = unlocked != 0 || achievement.progress >= achievement.target;
+                }
+            }
+        }
+    }
+
+    void saveAchievements() const {
+        if (progressPath_.empty()) return;
+        std::error_code error;
+        std::filesystem::create_directories(progressPath_.parent_path(), error);
+        std::ofstream output(progressPath_, std::ios::trunc);
+        for (const Achievement& achievement : achievements_)
+            output << achievement.id << ' ' << achievement.progress << ' ' << (achievement.unlocked ? 1 : 0) << '\n';
+    }
+
+    void setAchievementProgress(std::size_t index, int progress) {
+        if (index >= achievements_.size()) return;
+        Achievement& achievement = achievements_[index];
+        achievement.progress = glm::clamp(std::max(achievement.progress, progress), 0, achievement.target);
+        if (!achievement.unlocked && achievement.progress >= achievement.target) {
+            achievement.unlocked = true;
+            achievementPopup_ = achievement.title;
+            achievementPopupTimer_ = 4.5f;
+            audio_.play(SoundEffect::Start);
+            saveAchievements();
+        }
+    }
+
+    void incrementAchievement(std::size_t index, int amount = 1) {
+        if (index >= achievements_.size()) return;
+        setAchievementProgress(index, achievements_[index].progress + amount);
+    }
+
+    void renderAchievementPopup(float width) {
+        if (achievementPopupTimer_ <= 0.0f || achievementPopup_.empty()) return;
+        const float alpha = saturate(achievementPopupTimer_ * 2.0f);
+        renderer_.rect(width * 0.5f - 230.0f, 28.0f, 460.0f, 66.0f, {0.03f,0.02f,0.055f,0.92f * alpha});
+        renderer_.rect(width * 0.5f - 230.0f, 28.0f, 5.0f, 66.0f, rarityColor(Rarity::Legendary));
+        renderer_.text(width * 0.5f, 39.0f, "ACHIEVEMENT UNLOCKED", 1.65f,
+                       rarityColor(Rarity::Legendary), true);
+        renderer_.text(width * 0.5f, 66.0f, achievementPopup_, 2.35f, {0.95f,0.97f,1.0f,alpha}, true);
+    }
+
     void renderHUD() {
         const float width = static_cast<float>(renderer_.width());
         const float height = static_cast<float>(renderer_.height());
@@ -1724,29 +2493,43 @@ private:
         const glm::vec4 cyan{0.12f,0.88f,1.0f,1};
         const glm::vec4 red{1.0f,0.12f,0.26f,1};
         const glm::vec4 panel{0.008f,0.014f,0.035f,0.78f};
-        static constexpr std::array<const char*, 3> mapNames = {{"NEON YARD", "DUST DEPOT", "ICE LAB"}};
+        static constexpr std::array<const char*, 6> mapNames = {{
+            "NEON YARD", "DUST DEPOT", "ICE LAB", "SUBURBAN SIEGE", "ORBITAL STATION", "IRON FOUNDRY"
+        }};
         static constexpr std::array<const char*, 3> difficultyNames = {{"ROOKIE", "VETERAN", "NIGHTMARE"}};
         static constexpr std::array<const char*, 3> qualityNames = {{"POTATO", "BALANCED", "ULTRA"}};
+        static constexpr std::array<const char*, 4> operatorNames = {{"WRAITH", "VIPER", "NOMAD", "SPECTRE"}};
 
         if (mode_ == Mode::Title) {
             renderer_.rect(0, 0, width, height, {0.005f,0.008f,0.025f,0.56f});
             renderer_.text(width * 0.5f, height * 0.24f, "NEON ASSAULT", 9.0f, cyan, true);
             renderer_.text(width * 0.5f, height * 0.24f + 82.0f, "3D ARENA SHOOTER", 3.4f, white, true);
-            renderer_.rect(width * 0.5f - 180, height * 0.62f - 18, 360, 50, {0.02f,0.18f,0.25f,0.88f});
-            renderer_.text(width * 0.5f, height * 0.62f, "PRESS ENTER TO DEPLOY", 3.0f, white, true);
-            renderer_.rect(width * 0.5f - 310, height * 0.45f, 620, 102, panel);
-            renderer_.text(width * 0.5f, height * 0.465f,
+            renderer_.rect(width * 0.5f - 200, height * 0.72f - 18, 400, 50, {0.02f,0.18f,0.25f,0.88f});
+            renderer_.text(width * 0.5f, height * 0.72f, "PRESS ENTER TO DEPLOY", 3.0f, white, true);
+            renderer_.rect(width * 0.5f - 330, height * 0.405f, 660, 174, panel);
+            renderer_.text(width * 0.5f, height * 0.42f,
                            std::string("M MAP: ") + mapNames[static_cast<std::size_t>(selectedMap_)], 2.2f, white, true);
-            renderer_.text(width * 0.5f, height * 0.465f + 29,
+            renderer_.text(width * 0.5f, height * 0.42f + 28,
+                           std::string("G MODE: ") + gameModeName(gameMode_), 2.2f,
+                           gameMode_ == GameMode::Mayhem ? rarityColor(Rarity::Mythic) : cyan, true);
+            renderer_.text(width * 0.5f, height * 0.42f + 56,
                            std::string("D DIFFICULTY: ") + difficultyNames[static_cast<std::size_t>(difficulty_)],
                            2.2f, difficulty_ == 2 ? red : cyan, true);
-            renderer_.text(width * 0.5f, height * 0.465f + 58,
+            renderer_.text(width * 0.5f, height * 0.42f + 84,
                            std::string("Q GRAPHICS: ") + qualityNames[static_cast<std::size_t>(quality_)],
                            2.2f, quality_ == 0 ? glm::vec4(0.35f,1.0f,0.45f,1) : white, true);
-            renderer_.text(width * 0.5f, height - 84, "WASD MOVE  MOUSE AIM  1-6 WEAPONS  R RELOAD", 2.0f,
+            renderer_.text(width * 0.5f, height * 0.42f + 112,
+                           std::string("C OPERATOR: ") + operatorNames[static_cast<std::size_t>(selectedOperator_)],
+                           2.2f, white, true);
+            const WeaponDefinition& loadout = weaponDefinitions_[static_cast<std::size_t>(selectedWeapon_)];
+            renderer_.text(width * 0.5f, height * 0.42f + 140,
+                           std::string("1-0 LOADOUT: ") + loadout.name + "  [" + rarityName(loadout.rarity) + "]",
+                           2.1f, rarityColor(loadout.rarity), true);
+            renderer_.text(width * 0.5f, height - 70, "WASD MOVE  MOUSE AIM  1-0 WEAPONS  TAB INVENTORY  V CAMERA", 1.75f,
                            {0.55f,0.68f,0.78f,1}, true);
             renderer_.text(width - 12, height - 20, std::string("V") + NEON_VERSION, 1.4f,
                            {0.35f,0.45f,0.55f,1}, true);
+            renderAchievementPopup(width);
             return;
         }
 
@@ -1776,6 +2559,8 @@ private:
         const WeaponDefinition& definition = weaponDefinitions_[static_cast<std::size_t>(selectedWeapon_)];
         renderer_.rect(width - 354, height - 120, 330, 90, panel);
         renderer_.text(width - 332, height - 100, definition.name, 2.4f, glm::vec4(definition.color, 1));
+        renderer_.text(width - 52, height - 100, rarityName(definition.rarity), 1.3f,
+                       rarityColor(definition.rarity), true);
         renderer_.text(width - 332, height - 66,
                        std::to_string(weapon.loaded) + "/" + std::to_string(weapon.reserve), 4.2f, white);
         if (reloadTimer_ > 0.0f) {
@@ -1803,6 +2588,51 @@ private:
             renderer_.rect(width - 24, 0, 24, height, {1,0,0,alpha});
         }
 
+        if (inventoryOpen_) {
+            renderer_.rect(0, 0, width, height, {0.002f,0.004f,0.012f,0.90f});
+            renderer_.rect(62, 42, width - 124, height - 84, {0.012f,0.020f,0.045f,0.97f});
+            renderer_.text(width * 0.5f, 66, "ARSENAL / ACHIEVEMENTS", 4.0f, cyan, true);
+            renderer_.text(width * 0.5f, 108, "PRESS 1-0 TO EQUIP  -  TAB TO CLOSE", 1.6f,
+                           {0.56f,0.68f,0.78f,1}, true);
+            const float cardWidth = (width - 190.0f) * 0.5f;
+            for (int i = 0; i < static_cast<int>(weaponDefinitions_.size()); ++i) {
+                const int column = i / 5;
+                const int row = i % 5;
+                const float x = 82.0f + column * (cardWidth + 26.0f);
+                const float y = 142.0f + row * 64.0f;
+                const WeaponDefinition& item = weaponDefinitions_[static_cast<std::size_t>(i)];
+                const glm::vec4 rarity = rarityColor(item.rarity);
+                renderer_.rect(x, y, cardWidth, 52, i == selectedWeapon_
+                    ? glm::vec4(rarity.r * 0.18f, rarity.g * 0.18f, rarity.b * 0.18f, 0.96f)
+                    : glm::vec4(0.025f,0.035f,0.065f,0.96f));
+                renderer_.rect(x, y, 5, 52, rarity);
+                const std::string key = i == 9 ? "0" : std::to_string(i + 1);
+                renderer_.text(x + 18, y + 9, key + "  " + item.name, 1.75f, white);
+                renderer_.text(x + cardWidth - 18, y + 10, rarityName(item.rarity), 1.25f, rarity, true);
+                renderer_.text(x + 18, y + 32, "DMG " + std::to_string(item.damage) + "  MAG " +
+                               std::to_string(item.magazine), 1.15f, {0.55f,0.68f,0.78f,1});
+            }
+            int unlockedCount = 0;
+            for (const Achievement& achievement : achievements_) if (achievement.unlocked) ++unlockedCount;
+            renderer_.text(88, 480, "ACHIEVEMENTS " + std::to_string(unlockedCount) + "/" +
+                           std::to_string(achievements_.size()), 2.2f, rarityColor(Rarity::Legendary));
+            for (std::size_t i = 0; i < achievements_.size(); ++i) {
+                const Achievement& achievement = achievements_[i];
+                const int column = static_cast<int>(i / 4);
+                const int row = static_cast<int>(i % 4);
+                const float x = 88.0f + column * ((width - 190.0f) * 0.5f + 26.0f);
+                const float y = 518.0f + row * 49.0f;
+                renderer_.text(x, y, std::string(achievement.unlocked ? "[UNLOCKED] " : "[LOCKED] ") +
+                               achievement.title, 1.35f,
+                               achievement.unlocked ? rarityColor(Rarity::Legendary) : glm::vec4(0.45f,0.5f,0.58f,1));
+                renderer_.text(x, y + 20, std::to_string(achievement.progress) + "/" +
+                               std::to_string(achievement.target) + "  " + achievement.description,
+                               1.0f, {0.52f,0.62f,0.70f,1});
+            }
+            renderAchievementPopup(width);
+            return;
+        }
+
         if (mode_ == Mode::Paused) {
             renderer_.rect(0, 0, width, height, {0.003f,0.005f,0.015f,0.75f});
             renderer_.text(centerX, height * 0.38f, "PAUSED", 7.0f, cyan, true);
@@ -1818,6 +2648,7 @@ private:
             renderer_.text(centerX, height * 0.54f, "WAVE " + std::to_string(wave_), 2.5f, white, true);
             renderer_.text(centerX, height * 0.68f, "PRESS ENTER TO REDEPLOY", 2.7f, cyan, true);
         }
+        renderAchievementPopup(width);
     }
 
     float randomRange(float low, float high) {
@@ -1842,9 +2673,14 @@ private:
     Mesh cylinder_;
     GltfModel helmet_;
     GltfModel bottle_;
-    std::array<WeaponDefinition, 6> weaponDefinitions_{};
-    std::array<WeaponState, 6> weapons_{};
+    std::array<GltfModel, 10> gunModels_{};
+    std::array<GltfModel, 4> operatorModels_{};
+    std::array<GltfModel, 16> environmentModels_{};
+    std::array<WeaponDefinition, 10> weaponDefinitions_{};
+    std::array<WeaponState, 10> weapons_{};
+    std::array<Achievement, 8> achievements_{};
     std::vector<Block> blocks_;
+    std::vector<ModelPlacement> modelPlacements_;
     std::vector<glm::vec3> spawnPoints_;
     std::vector<Bot> bots_;
     std::vector<Pickup> pickups_;
@@ -1853,6 +2689,7 @@ private:
     std::mt19937 random_{0x4e454f4eu};
     Mode mode_ = Mode::Title;
     glm::vec3 playerPosition_{0,0,8};
+    glm::vec3 playerVelocity_{};
     float playerVerticalVelocity_ = 0.0f;
     float playerHealth_ = 100.0f;
     float yaw_ = 0.0f;
@@ -1869,14 +2706,25 @@ private:
     float cameraShake_ = 0.0f;
     float hitMarker_ = 0.0f;
     float killMarker_ = 0.0f;
+    float achievementPopupTimer_ = 0.0f;
+    std::string achievementPopup_;
+    std::filesystem::path progressPath_;
+    std::uint32_t weaponUsageMask_ = 0;
+    std::uint32_t mapUsageMask_ = 0;
     int selectedWeapon_ = 1;
     int reloadWeapon_ = -1;
     int score_ = 0;
     int kills_ = 0;
+    int headshots_ = 0;
+    int mythicKills_ = 0;
     int wave_ = 0;
     int selectedMap_ = 0;
+    int selectedOperator_ = 0;
     int difficulty_ = 1;
     int quality_ = 1;
+    GameMode gameMode_ = GameMode::Survival;
+    bool inventoryOpen_ = false;
+    bool thirdPerson_ = false;
     bool crouching_ = false;
     bool moving_ = false;
     bool onGround_ = true;
