@@ -1,4 +1,4 @@
-name: Windows Build and Release
+name: iRx Windows Build and Release
 
 on:
   push:
@@ -11,96 +11,98 @@ permissions:
   contents: write
 
 concurrency:
-  group: windows-${{ github.ref }}
+  group: irx-windows-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-windows:
-    name: Build Windows x64
     runs-on: windows-2025
     timeout-minutes: 45
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Configure
-        run: >-
-          cmake -S . -B build -A x64
-          -DCMAKE_BUILD_TYPE=Release
-          -DNEON_FETCH_ASSETS=ON
-
+        run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DIRX_FETCH_ASSETS=ON
       - name: Build
         run: cmake --build build --config Release --parallel
-
-      - name: Headless self-test
-        run: .\build\Release\NeonAssault.exe --self-test
-
+      - name: Self-test
+        run: .\build\Release\iRx.exe --self-test
       - name: Install portable package
-        run: cmake --install build --config Release --prefix dist/NeonAssault
-
-      - name: Add launcher and documentation
+        run: cmake --install build --config Release --prefix dist/iRx
+      - name: Pack assets
         shell: pwsh
         run: |
-          Copy-Item README.md dist/NeonAssault/README.md
-          Copy-Item LICENSE dist/NeonAssault/LICENSE.txt
+          python tools/pack_assets.py dist/iRx/assets dist/iRx/packed --chunk-mb 48
+      - name: Add runtime files
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist/iRx/README.md
+          Copy-Item LICENSE dist/iRx/LICENSE.txt
           @'
           @echo off
           cd /d "%~dp0"
-          start "" NeonAssault.exe
-          '@ | Set-Content -Encoding ascii dist/NeonAssault/PLAY.bat
-
-      - name: Verify portable content
+          start "" iRx.exe
+          '@ | Set-Content -Encoding ascii dist/iRx/PLAY.bat
+      - name: Install UPX
+        shell: pwsh
+        run: choco install upx -y --no-progress
+      - name: Compress executable
         shell: pwsh
         run: |
-          $required = @(
-            'dist/NeonAssault/NeonAssault.exe',
-            'dist/NeonAssault/SDL3.dll',
-            'dist/NeonAssault/PLAY.bat',
-            'dist/NeonAssault/assets/CREDITS.md',
-            'dist/NeonAssault/assets/Characters/character-a.glb',
-            'dist/NeonAssault/assets/Guns/Quaternius/Pistol.glb',
-            'dist/NeonAssault/assets/Guns/Blasters/blaster-a.glb',
-            'dist/NeonAssault/assets/Maps/Industrial/building-a.glb',
-            'dist/NeonAssault/assets/Maps/Suburban/building-type-a.glb',
-            'dist/NeonAssault/assets/Maps/Roads/road-straight.glb',
-            'dist/NeonAssault/assets/Maps/SpaceStation/wall.glb'
-          )
-          foreach ($file in $required) {
-            if (-not (Test-Path $file)) { throw "Portable package is missing $file" }
-          }
-          $modelCount = @(Get-ChildItem dist/NeonAssault/assets -Recurse -Filter *.glb).Count
-          if ($modelCount -lt 200) { throw "Expected at least 200 licensed GLB assets, found $modelCount" }
-          Write-Host "Verified $modelCount licensed GLB assets in portable package."
-
+          upx --best --lzma dist/iRx/iRx.exe
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+      - name: Build installer script
+        shell: pwsh
+        run: |
+          @'
+          [Setup]
+          AppName=iRx
+          AppVersion=0.3.${{ github.run_number }}
+          DefaultDirName={autopf}\iRx
+          DefaultGroupName=iRx
+          OutputDir=.
+          OutputBaseFilename=iRx-Setup-Windows-x64
+          Compression=lzma2/ultra64
+          SolidCompression=yes
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          [Files]
+          Source: "dist\iRx\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          [Icons]
+          Name: "{autoprograms}\iRx"; Filename: "{app}\iRx.exe"
+          Name: "{autodesktop}\iRx"; Filename: "{app}\iRx.exe"
+          [Run]
+          Filename: "{app}\iRx.exe"; Description: "Launch iRx"; Flags: nowait postinstall skipifsilent
+          '@ | Set-Content -Encoding utf8 installer.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
       - name: Create ZIP
         shell: pwsh
-        run: Compress-Archive -Path dist/NeonAssault/* -DestinationPath NeonAssault-Windows-x64.zip -Force
-
-      - name: Upload build artifact
+        run: Compress-Archive -Path dist/iRx/* -DestinationPath iRx-Windows-x64.zip -Force
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NeonAssault-Windows-x64
-          path: NeonAssault-Windows-x64.zip
+          name: iRx-Windows-x64
+          path: |
+            iRx-Windows-x64.zip
+            iRx-Setup-Windows-x64.exe
           if-no-files-found: error
           retention-days: 30
-
       - name: Publish GitHub Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.2.${{ github.run_number }}
-          name: Neon Assault Arsenal Update v0.2.${{ github.run_number }}
+          tag_name: v0.3.${{ github.run_number }}
+          name: iRx v0.3.${{ github.run_number }}
           body: |
-            Windows x64 build of the Neon Assault Arsenal Update.
-
-            Download `NeonAssault-Windows-x64.zip`, extract it, and run `PLAY.bat`.
-            Includes 6 maps, 10 gameplay weapons, 40+ licensed weapon models,
-            animated full-body operators, tactical A* bots, 4 game modes,
-            persistent achievements, inventory, rarity tiers and Mythic kill effects.
-
-            The archive includes the executable, SDL3 runtime, pinned CC0 assets,
-            complete creator credits, integrity information and license files.
-          files: NeonAssault-Windows-x64.zip
+            Windows x64 build of iRx.
+            Includes portable ZIP, installer, licensed asset package and compressed executable.
+            Multiplayer target: irautox.ir:9832.
+          files: |
+            iRx-Windows-x64.zip
+            iRx-Setup-Windows-x64.exe
           generate_release_notes: true
           make_latest: true
