@@ -7,16 +7,6 @@ import time
 from pathlib import Path
 
 
-def recv_line(sock):
-    data = bytearray()
-    while not data.endswith(b"\n"):
-        part = sock.recv(4096)
-        if not part:
-            raise RuntimeError("server closed connection")
-        data.extend(part)
-    return json.loads(data.decode("utf-8"))
-
-
 def main():
     server_dir = Path(__file__).resolve().parent
     env = os.environ.copy()
@@ -39,8 +29,9 @@ def main():
         if sock is None:
             raise RuntimeError("server did not accept connections")
         with sock:
+            stream = sock.makefile("rb")
             sock.sendall(b'{"type":"hello","name":"BuildTest","protocol":2}\n')
-            welcome = recv_line(sock)
+            welcome = json.loads(stream.readline().decode("utf-8"))
             if welcome.get("type") != "welcome" or welcome.get("protocol") != 2 or not welcome.get("token"):
                 raise RuntimeError("invalid welcome packet")
             token = welcome["token"]
@@ -49,7 +40,7 @@ def main():
             deadline = time.time() + 3
             joined = False
             while time.time() < deadline:
-                packet = recv_line(sock)
+                packet = json.loads(stream.readline().decode("utf-8"))
                 if packet.get("type") == "join" and packet.get("team") == "terrorist":
                     joined = True
                     break
@@ -60,7 +51,7 @@ def main():
             deadline = time.time() + 3
             pong = False
             while time.time() < deadline:
-                packet = recv_line(sock)
+                packet = json.loads(stream.readline().decode("utf-8"))
                 if packet.get("type") == "pong":
                     pong = True
                     break
@@ -73,12 +64,9 @@ def main():
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             process.kill()
-        db = server_dir / "smoke_test.db"
-        wal = server_dir / "smoke_test.db-wal"
-        shm = server_dir / "smoke_test.db-shm"
-        for path in (db, wal, shm):
+        for name in ("smoke_test.db", "smoke_test.db-wal", "smoke_test.db-shm"):
             try:
-                path.unlink()
+                (server_dir / name).unlink()
             except FileNotFoundError:
                 pass
 
