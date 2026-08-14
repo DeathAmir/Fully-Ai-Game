@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(iRx VERSION 0.3.0 LANGUAGES C CXX)
+project(iRx VERSION 0.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 option(IRX_FETCH_ASSETS "Download pinned, licensed glTF game assets" ON)
 
 include(FetchContent)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(FETCHCONTENT_QUIET OFF)
 
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
@@ -47,6 +48,7 @@ FetchContent_Declare(tinygltf GIT_REPOSITORY https://github.com/syoyo/tinygltf.g
 FetchContent_MakeAvailable(tinygltf)
 
 set(IRX_GENERATED_ASSET_DIR "${CMAKE_BINARY_DIR}/game_assets")
+set(NEON_GENERATED_ASSET_DIR "${IRX_GENERATED_ASSET_DIR}")
 if(IRX_FETCH_ASSETS)
     include(cmake/FetchGameAssets.cmake)
 else()
@@ -54,17 +56,48 @@ else()
     configure_file(assets/CREDITS.md "${IRX_GENERATED_ASSET_DIR}/CREDITS.md" COPYONLY)
 endif()
 
-add_executable(iRx WIN32 src/main.cpp)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_art.py" "${IRX_GENERATED_ASSET_DIR}"
+    RESULT_VARIABLE IRX_ART_RESULT
+)
+if(NOT IRX_ART_RESULT EQUAL 0)
+    message(FATAL_ERROR "iRx generated texture pipeline failed")
+endif()
+
+set(IRX_RUNTIME_SOURCES
+    src/core/bootstrap.cpp
+    src/core/runtime.cpp
+    src/net/client.cpp
+    src/net/protocol.cpp
+    src/gameplay/weapon_catalog.cpp
+    src/gameplay/match_rules.cpp
+    src/gameplay/bomb_system.cpp
+    src/assets/asset_registry.cpp
+    src/security/integrity.cpp
+    src/ui/menu_model.cpp
+)
+
+add_library(irx_runtime OBJECT ${IRX_RUNTIME_SOURCES})
+target_include_directories(irx_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_definitions(irx_runtime PRIVATE IRX_SERVER_HOST="irautox.ir" IRX_SERVER_PORT=9832 IRX_VERSION="${PROJECT_VERSION}")
+
+add_executable(iRx WIN32 src/main.cpp $<TARGET_OBJECTS:irx_runtime>)
+target_include_directories(iRx PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(iRx PRIVATE SDL3::SDL3 glm::glm irx_glew tinygltf)
 target_compile_definitions(iRx PRIVATE GLM_FORCE_RADIANS GLM_ENABLE_EXPERIMENTAL NEON_VERSION="${PROJECT_VERSION}" IRX_VERSION="${PROJECT_VERSION}" IRX_SERVER_HOST="irautox.ir" IRX_SERVER_PORT=9832)
 
 if(MSVC)
+    target_compile_options(irx_runtime PRIVATE /W4 /permissive- /EHsc /utf-8)
     target_compile_options(iRx PRIVATE /W4 /permissive- /EHsc /utf-8)
 else()
+    target_compile_options(irx_runtime PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(iRx PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_custom_command(TARGET iRx POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory "${IRX_GENERATED_ASSET_DIR}" "$<TARGET_FILE_DIR:iRx>/assets")
+add_custom_command(TARGET iRx POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${IRX_GENERATED_ASSET_DIR}" "$<TARGET_FILE_DIR:iRx>/assets"
+    COMMENT "Copying licensed and generated iRx assets"
+)
 
 install(TARGETS iRx RUNTIME DESTINATION .)
 install(DIRECTORY "${IRX_GENERATED_ASSET_DIR}/" DESTINATION assets)
