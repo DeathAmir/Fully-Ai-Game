@@ -1,4 +1,4 @@
-name: Windows Build and Release
+name: iRx Windows Build and Release
 
 on:
   push:
@@ -11,14 +11,14 @@ permissions:
   contents: write
 
 concurrency:
-  group: windows-${{ github.ref }}
+  group: irx-windows-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-windows:
-    name: Build Windows x64
+    name: Build iRx Windows x64
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 55
 
     steps:
       - name: Checkout
@@ -34,54 +34,68 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       - name: Headless self-test
-        run: .\build\Release\NeonAssault.exe --self-test
+        run: .\build\Release\iRx.exe --self-test
 
       - name: Install portable package
-        run: cmake --install build --config Release --prefix dist/NeonAssault
+        run: cmake --install build --config Release --prefix dist/iRx
 
-      - name: Add launcher and documentation
+      - name: Add launcher and documents
         shell: pwsh
         run: |
-          Copy-Item README.md dist/NeonAssault/README.md
-          Copy-Item LICENSE dist/NeonAssault/LICENSE.txt
+          Copy-Item README.md dist/iRx/README.md
+          Copy-Item LICENSE dist/iRx/LICENSE.txt
           @'
           @echo off
           cd /d "%~dp0"
-          start "" NeonAssault.exe
-          '@ | Set-Content -Encoding ascii dist/NeonAssault/PLAY.bat
+          start "" iRx.exe
+          '@ | Set-Content -Encoding ascii dist/iRx/PLAY.bat
+
+      - name: Compress executable
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install upx -y --no-progress
+          upx --best --lzma dist/iRx/iRx.exe
 
       - name: Verify portable content
         shell: pwsh
         run: |
           $required = @(
-            'dist/NeonAssault/NeonAssault.exe',
-            'dist/NeonAssault/SDL3.dll',
-            'dist/NeonAssault/PLAY.bat',
-            'dist/NeonAssault/assets/CREDITS.md',
-            'dist/NeonAssault/assets/Characters/character-a.glb',
-            'dist/NeonAssault/assets/Guns/Quaternius/Pistol.glb',
-            'dist/NeonAssault/assets/Guns/Blasters/blaster-a.glb',
-            'dist/NeonAssault/assets/Maps/Industrial/building-a.glb',
-            'dist/NeonAssault/assets/Maps/Suburban/building-type-a.glb',
-            'dist/NeonAssault/assets/Maps/Roads/road-straight.glb',
-            'dist/NeonAssault/assets/Maps/SpaceStation/wall.glb'
+            'dist/iRx/iRx.exe',
+            'dist/iRx/SDL3.dll',
+            'dist/iRx/PLAY.bat',
+            'dist/iRx/assets/CREDITS.md',
+            'dist/iRx/assets/Characters/character-a.glb',
+            'dist/iRx/assets/Guns/Quaternius/Pistol.glb',
+            'dist/iRx/assets/Guns/Blasters/blaster-a.glb',
+            'dist/iRx/assets/Maps/Industrial/building-a.glb',
+            'dist/iRx/assets/Maps/Suburban/building-type-a.glb',
+            'dist/iRx/assets/Maps/Roads/road-straight.glb',
+            'dist/iRx/assets/Maps/SpaceStation/wall.glb'
           )
           foreach ($file in $required) {
             if (-not (Test-Path $file)) { throw "Portable package is missing $file" }
           }
-          $modelCount = @(Get-ChildItem dist/NeonAssault/assets -Recurse -Filter *.glb).Count
+          $modelCount = @(Get-ChildItem dist/iRx/assets -Recurse -Filter *.glb).Count
           if ($modelCount -lt 200) { throw "Expected at least 200 licensed GLB assets, found $modelCount" }
-          Write-Host "Verified $modelCount licensed GLB assets in portable package."
+          Write-Host "Verified $modelCount licensed GLB assets."
 
-      - name: Create ZIP
+      - name: Build NAUPK asset chunks
+        run: python tools/pack_assets.py create dist/iRx/assets dist/iRxAssetPacks --chunk-mb 96
+
+      - name: Create release archives
         shell: pwsh
-        run: Compress-Archive -Path dist/NeonAssault/* -DestinationPath NeonAssault-Windows-x64.zip -Force
+        run: |
+          Compress-Archive -Path dist/iRx/* -DestinationPath iRx-Windows-x64.zip -Force
+          Compress-Archive -Path dist/iRxAssetPacks/* -DestinationPath iRx-AssetPacks.zip -Force
 
-      - name: Upload build artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: NeonAssault-Windows-x64
-          path: NeonAssault-Windows-x64.zip
+          name: iRx-Windows-x64
+          path: |
+            iRx-Windows-x64.zip
+            iRx-AssetPacks.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -89,18 +103,21 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.2.${{ github.run_number }}
-          name: Neon Assault Arsenal Update v0.2.${{ github.run_number }}
+          tag_name: v0.3.${{ github.run_number }}
+          name: iRx Tactical Multiplayer v0.3.${{ github.run_number }}
           body: |
-            Windows x64 build of the Neon Assault Arsenal Update.
+            iRx Windows x64 multiplayer foundation.
 
-            Download `NeonAssault-Windows-x64.zip`, extract it, and run `PLAY.bat`.
-            Includes 6 maps, 10 gameplay weapons, 40+ licensed weapon models,
-            animated full-body operators, tactical A* bots, 4 game modes,
-            persistent achievements, inventory, rarity tiers and Mythic kill effects.
+            Connects to irautox.ir:9832 with a challenge-response UDP protocol.
+            Includes Terrorist and Counter-Terrorist teams, authoritative round and bomb state,
+            server-validated weapons, remote operators, scoreboard, buy menu, aiming,
+            grenades, footsteps, full-screen mode, IrAutoX AC splash, six textured arenas,
+            ten weapon classes, persistent achievements and Legendary/Mythic effects.
 
-            The archive includes the executable, SDL3 runtime, pinned CC0 assets,
-            complete creator credits, integrity information and license files.
-          files: NeonAssault-Windows-x64.zip
+            Download iRx-Windows-x64.zip, extract it and run PLAY.bat.
+            iRx-AssetPacks.zip contains verified .na1 through .naupk update chunks.
+          files: |
+            iRx-Windows-x64.zip
+            iRx-AssetPacks.zip
           generate_release_notes: true
           make_latest: true

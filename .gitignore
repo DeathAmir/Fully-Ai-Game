@@ -13,4 +13,7 @@
 *.exe
 *.dll
 *.zip
-
+__pycache__/
+*.pyc
+*.naupk
+*.na[0-9a-z]

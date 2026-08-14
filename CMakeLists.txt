@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(NeonAssault VERSION 0.2.0 LANGUAGES C CXX)
+project(iRx VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 option(NEON_FETCH_ASSETS "Download pinned, licensed glTF game assets" ON)
+set(IRX_DISCORD_APP_ID "" CACHE STRING "Discord application id used for Rich Presence")
 
 include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
@@ -75,45 +76,52 @@ else()
     configure_file(assets/CREDITS.md "${NEON_GENERATED_ASSET_DIR}/CREDITS.md" COPYONLY)
 endif()
 
-add_executable(NeonAssault WIN32
+add_executable(iRx WIN32
     src/main.cpp
+    src/net_client.cpp
+    src/discord_rpc.cpp
 )
 
-target_link_libraries(NeonAssault PRIVATE
+target_link_libraries(iRx PRIVATE
     SDL3::SDL3
     glm::glm
     neon_glew
     tinygltf
 )
 
-target_compile_definitions(NeonAssault PRIVATE
+target_compile_definitions(iRx PRIVATE
     GLM_FORCE_RADIANS
     GLM_ENABLE_EXPERIMENTAL
     NEON_VERSION="${PROJECT_VERSION}"
+    IRX_DISCORD_APP_ID="${IRX_DISCORD_APP_ID}"
 )
 
 if(MSVC)
-    target_compile_options(NeonAssault PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_compile_options(iRx PRIVATE /W4 /permissive- /EHsc /utf-8)
 else()
-    target_compile_options(NeonAssault PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(iRx PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_custom_command(TARGET NeonAssault POST_BUILD
+if(WIN32)
+    target_link_libraries(iRx PRIVATE ws2_32)
+endif()
+
+add_custom_command(TARGET iRx POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${NEON_GENERATED_ASSET_DIR}"
-        "$<TARGET_FILE_DIR:NeonAssault>/assets"
+        "$<TARGET_FILE_DIR:iRx>/assets"
     COMMENT "Copying game assets"
 )
 
-install(TARGETS NeonAssault RUNTIME DESTINATION .)
+install(TARGETS iRx RUNTIME DESTINATION .)
 install(DIRECTORY "${NEON_GENERATED_ASSET_DIR}/" DESTINATION assets)
 if(TARGET SDL3-shared)
     install(TARGETS SDL3-shared RUNTIME DESTINATION . LIBRARY DESTINATION .)
 endif()
 
 include(InstallRequiredSystemLibraries)
-set(CPACK_PACKAGE_NAME "NeonAssault")
-set(CPACK_PACKAGE_VENDOR "DeathAmir")
+set(CPACK_PACKAGE_NAME "iRx")
+set(CPACK_PACKAGE_VENDOR "IrAutoX")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_GENERATOR "ZIP")
 include(CPack)

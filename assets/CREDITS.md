@@ -60,6 +60,6 @@ License metadata is recorded in the upstream model READMEs.
 - GLM — Happy Bunny / MIT-style license
 - tinygltf — MIT license
 
-OpenGL is provided by the operating system/graphics driver. Neon Assault's own
+OpenGL is provided by the operating system/graphics driver. iRx's own
 source is distributed under the repository's MIT license. No GPL asset or code
 is currently bundled, avoiding share-alike ambiguity for the executable.
