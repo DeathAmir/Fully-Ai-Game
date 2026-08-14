@@ -17,29 +17,65 @@ concurrency:
 jobs:
   build-windows:
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Validate Python server
+        shell: pwsh
+        run: |
+          python -m py_compile server/config.py server/models.py server/storage.py server/security.py server/game.py server/main.py server/irx_server.py server/smoke_test.py
+          python server/smoke_test.py
       - name: Configure
         run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DIRX_FETCH_ASSETS=ON
       - name: Build
         run: cmake --build build --config Release --parallel
       - name: Self-test
+        shell: pwsh
+        env:
+          IRX_DISABLE_NETWORK: '1'
         run: .\build\Release\iRx.exe --self-test
       - name: Install portable package
         run: cmake --install build --config Release --prefix dist/iRx
-      - name: Pack assets
+      - name: Verify licensed and generated assets
         shell: pwsh
         run: |
-          python tools/pack_assets.py dist/iRx/assets dist/iRx/packed --chunk-mb 48
+          $required = @(
+            'dist/iRx/iRx.exe',
+            'dist/iRx/SDL3.dll',
+            'dist/iRx/assets/CREDITS.md',
+            'dist/iRx/assets/Generated/manifest.json',
+            'dist/iRx/assets/Generated/UI/main_menu.png',
+            'dist/iRx/assets/Generated/UI/buy_panel.png',
+            'dist/iRx/assets/Generated/UI/scoreboard.png',
+            'dist/iRx/assets/Generated/Materials/concrete.png',
+            'dist/iRx/assets/Generated/Materials/metal.png',
+            'dist/iRx/assets/Generated/Characters/terrorist_fabric.png',
+            'dist/iRx/assets/Generated/Characters/counter_fabric.png',
+            'dist/iRx/assets/Generated/Effects/mythic_ember.png',
+            'dist/iRx/assets/Generated/Effects/mythic_void.png',
+            'dist/iRx/assets/Characters/character-a.glb',
+            'dist/iRx/assets/Guns/Quaternius/Pistol.glb',
+            'dist/iRx/assets/Maps/Industrial/building-a.glb'
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) { throw "Missing release asset: $file" }
+          }
+          $modelCount = @(Get-ChildItem dist/iRx/assets -Recurse -Filter *.glb).Count
+          if ($modelCount -lt 200) { throw "Expected at least 200 licensed GLB assets, found $modelCount" }
+          Write-Host "Verified $modelCount licensed models plus generated iRx textures."
+      - name: Pack assets
+        shell: pwsh
+        run: python tools/pack_assets.py dist/iRx/assets dist/iRx/packed --chunk-mb 48
       - name: Add runtime files
         shell: pwsh
         run: |
           Copy-Item README.md dist/iRx/README.md
           Copy-Item LICENSE dist/iRx/LICENSE.txt
+          New-Item -ItemType Directory -Force dist/iRx/server | Out-Null
+          Copy-Item server/config.py,server/models.py,server/storage.py,server/security.py,server/game.py,server/main.py,server/irx_server.py dist/iRx/server/
           @'
           @echo off
           cd /d "%~dp0"
@@ -50,18 +86,19 @@ jobs:
         run: choco install upx -y --no-progress
       - name: Compress executable
         shell: pwsh
-        run: |
-          upx --best --lzma dist/iRx/iRx.exe
+        run: upx --best --lzma dist/iRx/iRx.exe
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup -y --no-progress
-      - name: Build installer script
+      - name: Build installer
         shell: pwsh
         run: |
           @'
           [Setup]
+          AppId={{C5636D82-8A95-4ED1-9BAA-5E7E44E1C9B2}
           AppName=iRx
-          AppVersion=0.3.${{ github.run_number }}
+          AppPublisher=IrAutoX
+          AppVersion=0.4.${{ github.run_number }}
           DefaultDirName={autopf}\iRx
           DefaultGroupName=iRx
           OutputDir=.
@@ -70,11 +107,13 @@ jobs:
           SolidCompression=yes
           ArchitecturesAllowed=x64compatible
           ArchitecturesInstallIn64BitMode=x64compatible
+          UninstallDisplayIcon={app}\iRx.exe
+          WizardStyle=modern
           [Files]
           Source: "dist\iRx\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
           [Icons]
-          Name: "{autoprograms}\iRx"; Filename: "{app}\iRx.exe"
-          Name: "{autodesktop}\iRx"; Filename: "{app}\iRx.exe"
+          Name: "{autoprograms}\iRx"; Filename: "{app}\iRx.exe"; WorkingDir: "{app}"
+          Name: "{autodesktop}\iRx"; Filename: "{app}\iRx.exe"; WorkingDir: "{app}"
           [Run]
           Filename: "{app}\iRx.exe"; Description: "Launch iRx"; Flags: nowait postinstall skipifsilent
           '@ | Set-Content -Encoding utf8 installer.iss
@@ -95,12 +134,13 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.3.${{ github.run_number }}
-          name: iRx v0.3.${{ github.run_number }}
+          tag_name: v0.4.${{ github.run_number }}
+          name: iRx v0.4.${{ github.run_number }}
           body: |
-            Windows x64 build of iRx.
-            Includes portable ZIP, installer, licensed asset package and compressed executable.
+            iRx Windows x64 modular multiplayer build.
+            Includes portable ZIP and Inno Setup installer.
             Multiplayer target: irautox.ir:9832.
+            Includes CC0 Kenney and Quaternius models, generated iRx texture/UI pack, asset packing, UPX compression, server persistence, competitive T/CT round rules and protocol v2 validation.
           files: |
             iRx-Windows-x64.zip
             iRx-Setup-Windows-x64.exe
