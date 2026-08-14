@@ -1,0 +1,149 @@
+import json
+import math
+import os
+import struct
+import sys
+import zlib
+from pathlib import Path
+
+
+def png(path: Path, width: int, height: int, pixel):
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)
+        for x in range(width):
+            r, g, b, a = pixel(x, y, width, height)
+            raw.extend((max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b))), max(0, min(255, int(a)))))
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    payload = b"\x89PNG\r\n\x1a\n"
+    payload += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+    payload += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    payload += chunk(b"IEND", b"")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def noise(x, y, seed=1):
+    n = (x * 374761393 + y * 668265263 + seed * 69069) & 0xFFFFFFFF
+    n = (n ^ (n >> 13)) * 1274126177 & 0xFFFFFFFF
+    return ((n ^ (n >> 16)) & 255) / 255.0
+
+
+def concrete(x, y, w, h):
+    n = noise(x, y, 7)
+    joint = 0.48 if x % 48 in (0, 1) or y % 48 in (0, 1) else 1.0
+    v = (105 + n * 48) * joint
+    return v, v * 0.98, v * 0.94, 255
+
+
+def metal(x, y, w, h):
+    n = noise(x // 2, y, 13)
+    stripe = 16 if x % 64 < 2 else 0
+    v = 78 + n * 55 + stripe
+    return v * 0.86, v * 0.94, v, 255
+
+
+def sand(x, y, w, h):
+    n = noise(x, y, 29)
+    return 150 + n * 48, 126 + n * 38, 83 + n * 27, 255
+
+
+def tile(x, y, w, h):
+    border = x % 32 < 2 or y % 32 < 2
+    if border:
+        return 28, 31, 36, 255
+    n = noise(x, y, 31)
+    return 78 + n * 25, 88 + n * 28, 94 + n * 30, 255
+
+
+def fabric_t(x, y, w, h):
+    weave = 18 if (x + y) % 6 == 0 else 0
+    n = noise(x, y, 43)
+    return 88 + weave + n * 20, 48 + n * 14, 34 + n * 10, 255
+
+
+def fabric_ct(x, y, w, h):
+    weave = 16 if (x + y) % 6 == 0 else 0
+    n = noise(x, y, 47)
+    return 30 + n * 14, 61 + weave + n * 18, 86 + n * 23, 255
+
+
+def ember(x, y, w, h):
+    dx = (x - w * 0.5) / (w * 0.5)
+    dy = (y - h * 0.5) / (h * 0.5)
+    d = math.sqrt(dx * dx + dy * dy)
+    pulse = max(0.0, 1.0 - d)
+    flame = max(0.0, math.sin((x * 0.19 + y * 0.08)) * 0.5 + 0.5) * pulse
+    return 255, 55 + 170 * flame, 8 + 40 * flame, 255 * pulse
+
+
+def void(x, y, w, h):
+    dx = x - w * 0.5
+    dy = y - h * 0.5
+    angle = math.atan2(dy, dx)
+    radius = math.sqrt(dx * dx + dy * dy)
+    wave = math.sin(radius * 0.22 - angle * 5.0) * 0.5 + 0.5
+    alpha = max(0.0, 1.0 - radius / (w * 0.5))
+    return 72 + 90 * wave, 22 + 50 * wave, 160 + 80 * wave, 255 * alpha
+
+
+def smoke(x, y, w, h):
+    dx = (x - w * 0.5) / (w * 0.5)
+    dy = (y - h * 0.5) / (h * 0.5)
+    d = math.sqrt(dx * dx + dy * dy)
+    n = noise(x // 3, y // 3, 61)
+    a = max(0.0, min(1.0, 1.0 - d)) * (0.45 + n * 0.55)
+    v = 145 + n * 62
+    return v, v, v + 4, 230 * a
+
+
+def menu(x, y, w, h):
+    fy = y / max(1, h - 1)
+    fx = x / max(1, w - 1)
+    grid = 18 if x % 80 < 1 or y % 80 < 1 else 0
+    glow = max(0.0, 1.0 - math.sqrt((fx - 0.72) ** 2 + (fy - 0.42) ** 2) * 2.2)
+    return 7 + grid + glow * 16, 12 + grid + glow * 38, 22 + grid + glow * 58, 255
+
+
+def panel(x, y, w, h):
+    border = x < 3 or y < 3 or x >= w - 3 or y >= h - 3
+    if border:
+        return 34, 134, 185, 255
+    return 9, 15, 25, 232
+
+
+def crosshair(x, y, w, h):
+    cx, cy = w // 2, h // 2
+    line = (abs(x - cx) <= 1 and 6 <= abs(y - cy) <= 15) or (abs(y - cy) <= 1 and 6 <= abs(x - cx) <= 15)
+    return (235, 245, 255, 255) if line else (0, 0, 0, 0)
+
+
+def main():
+    root = Path(sys.argv[1] if len(sys.argv) > 1 else "generated_assets") / "Generated"
+    entries = [
+        ("Materials/concrete.png", 256, 256, concrete, "map material"),
+        ("Materials/metal.png", 256, 256, metal, "map material"),
+        ("Materials/sand.png", 256, 256, sand, "map material"),
+        ("Materials/tile.png", 256, 256, tile, "map material"),
+        ("Characters/terrorist_fabric.png", 256, 256, fabric_t, "operator material"),
+        ("Characters/counter_fabric.png", 256, 256, fabric_ct, "operator material"),
+        ("Effects/mythic_ember.png", 256, 256, ember, "mythic effect"),
+        ("Effects/mythic_void.png", 256, 256, void, "mythic effect"),
+        ("Effects/smoke.png", 256, 256, smoke, "particle effect"),
+        ("UI/main_menu.png", 1024, 576, menu, "main menu"),
+        ("UI/buy_panel.png", 768, 512, panel, "buy menu"),
+        ("UI/scoreboard.png", 768, 480, panel, "scoreboard"),
+        ("UI/crosshair.png", 64, 64, crosshair, "crosshair"),
+    ]
+    manifest = []
+    for relative, width, height, fn, purpose in entries:
+        target = root / relative
+        png(target, width, height, fn)
+        manifest.append({"path": str(Path("Generated") / relative).replace(os.sep, "/"), "purpose": purpose, "license": "MIT", "source": "generated by tools/generate_art.py"})
+    (root / "manifest.json").write_text(json.dumps({"assets": manifest}, indent=2), encoding="utf-8")
+    print(f"generated {len(entries)} iRx textures")
+
+
+if __name__ == "__main__":
+    main()
