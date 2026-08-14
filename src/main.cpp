@@ -9,6 +9,9 @@
 #include <glm/gtx/norm.hpp>
 #include <tiny_gltf.h>
 
+#include "net_client.hpp"
+#include "discord_rpc.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -905,7 +908,7 @@ private:
     std::vector<Animation> animations_;
 };
 
-enum class SoundEffect { Pistol, Rifle, Shotgun, Enemy, Hit, Kill, Pickup, Reload, Empty, Start };
+enum class SoundEffect { Pistol, Rifle, Shotgun, Enemy, Hit, Kill, Pickup, Reload, Empty, Start, Footstep, Plant, Defuse, Grenade };
 
 class AudioEngine {
 public:
@@ -947,6 +950,21 @@ public:
             case SoundEffect::Start:
                 addVoice(330.0f, 0.32f, 0.12f, 0.02f, 0.6f);
                 addVoice(495.0f, 0.32f, 0.10f, 0.02f, 0.5f, 0.08f);
+                break;
+            case SoundEffect::Footstep:
+                addVoice(68.0f, 0.065f, 0.16f, 0.72f, -0.35f);
+                break;
+            case SoundEffect::Plant:
+                addVoice(610.0f, 0.09f, 0.14f, 0.05f, 0.15f);
+                addVoice(760.0f, 0.08f, 0.12f, 0.03f, 0.25f, 0.12f);
+                break;
+            case SoundEffect::Defuse:
+                addVoice(880.0f, 0.11f, 0.12f, 0.02f, -0.18f);
+                addVoice(1040.0f, 0.12f, 0.10f, 0.02f, 0.12f, 0.13f);
+                break;
+            case SoundEffect::Grenade:
+                addVoice(82.0f, 0.35f, 0.48f, 0.82f, -0.74f);
+                addVoice(42.0f, 0.42f, 0.35f, 0.68f, -0.45f);
                 break;
         }
     }
@@ -1033,6 +1051,13 @@ struct InputFrame {
     bool operatorPressed = false;
     bool inventoryPressed = false;
     bool thirdPersonPressed = false;
+    bool aimHeld = false;
+    bool scoreboardHeld = false;
+    bool usePressed = false;
+    bool grenadePressed = false;
+    bool terroristPressed = false;
+    bool counterTerroristPressed = false;
+    bool fullscreenPressed = false;
 
     void clearTransient() {
         mouseX = mouseY = 0.0f;
@@ -1040,6 +1065,7 @@ struct InputFrame {
         firePressed = reloadPressed = pausePressed = confirmPressed = false;
         mapPressed = difficultyPressed = qualityPressed = false;
         gameModePressed = operatorPressed = inventoryPressed = thirdPersonPressed = false;
+        usePressed = grenadePressed = terroristPressed = counterTerroristPressed = fullscreenPressed = false;
         weaponPressed.fill(false);
     }
 };
@@ -1070,10 +1096,11 @@ glm::vec4 rarityColor(Rarity rarity) {
     return glm::vec4(1.0f);
 }
 
-enum class GameMode { Survival, Elimination, HeadHunter, Mayhem };
+enum class GameMode { BombDefusal, Survival, Elimination, HeadHunter, Mayhem };
 
 const char* gameModeName(GameMode mode) {
     switch (mode) {
+        case GameMode::BombDefusal: return "BOMB DEFUSAL";
         case GameMode::Survival: return "SURVIVAL";
         case GameMode::Elimination: return "ELIMINATION";
         case GameMode::HeadHunter: return "HEAD HUNTER";
@@ -1178,7 +1205,7 @@ struct Tracer {
 
 class Game {
 public:
-    enum class Mode { Title, Playing, Paused, Dead };
+    enum class Mode { Protection, Title, Playing, Paused, Dead };
 
     Game(Renderer& renderer, AudioEngine& audio)
         : renderer_(renderer), audio_(audio), cube_(makeCube()), cylinder_(makeCylinder()) {
@@ -1229,7 +1256,9 @@ public:
         buildMap();
         initializeAchievements();
         reset(false);
-        mode_ = Mode::Title;
+        network_.connect("irautox.ir", 9832, "iRxPlayer");
+        gameMode_ = GameMode::BombDefusal;
+        mode_ = Mode::Protection;
     }
 
     void handleEvent(const SDL_Event& event, InputFrame& input) {
@@ -1243,9 +1272,11 @@ public:
                     input.fireHeld = true;
                     input.firePressed = true;
                 }
+                if (event.button.button == SDL_BUTTON_RIGHT) input.aimHeld = true;
                 break;
             case SDL_EVENT_MOUSE_BUTTON_UP:
                 if (event.button.button == SDL_BUTTON_LEFT) input.fireHeld = false;
+                if (event.button.button == SDL_BUTTON_RIGHT) input.aimHeld = false;
                 break;
             case SDL_EVENT_MOUSE_WHEEL:
                 input.wheel += static_cast<int>(event.wheel.y);
@@ -1268,10 +1299,21 @@ public:
                 if (event.key.scancode == SDL_SCANCODE_M) input.mapPressed = true;
                 if (event.key.scancode == SDL_SCANCODE_D) input.difficultyPressed = true;
                 if (event.key.scancode == SDL_SCANCODE_Q) input.qualityPressed = true;
-                if (event.key.scancode == SDL_SCANCODE_G) input.gameModePressed = true;
+                if (event.key.scancode == SDL_SCANCODE_G) {
+                    input.gameModePressed = true;
+                    input.grenadePressed = true;
+                }
                 if (event.key.scancode == SDL_SCANCODE_C) input.operatorPressed = true;
-                if (event.key.scancode == SDL_SCANCODE_TAB) input.inventoryPressed = true;
+                if (event.key.scancode == SDL_SCANCODE_B) input.inventoryPressed = true;
+                if (event.key.scancode == SDL_SCANCODE_TAB) input.scoreboardHeld = true;
                 if (event.key.scancode == SDL_SCANCODE_V) input.thirdPersonPressed = true;
+                if (event.key.scancode == SDL_SCANCODE_E) input.usePressed = true;
+                if (event.key.scancode == SDL_SCANCODE_F1) input.terroristPressed = true;
+                if (event.key.scancode == SDL_SCANCODE_F2) input.counterTerroristPressed = true;
+                if (event.key.scancode == SDL_SCANCODE_F11) input.fullscreenPressed = true;
+                break;
+            case SDL_EVENT_KEY_UP:
+                if (event.key.scancode == SDL_SCANCODE_TAB) input.scoreboardHeld = false;
                 break;
             default: break;
         }
@@ -1281,6 +1323,31 @@ public:
         time_ += deltaTime;
         deltaTime = std::min(deltaTime, 0.05f);
         achievementPopupTimer_ = std::max(0.0f, achievementPopupTimer_ - deltaTime);
+        protectionTimer_ += deltaTime;
+        network_.poll(deltaTime);
+        discordTimer_ -= deltaTime;
+        if (discordTimer_ <= 0.0f) {
+            const std::string details = network_.connected() ? "Online Bomb Defusal" : "Offline Practice";
+            const std::string presenceState = network_.connected()
+                ? std::string(network_.team() == irx::Team::Terrorist ? "Terrorist" : "Counter-Terrorist") +
+                  "  " + std::to_string(network_.snapshot().terroristScore) + ":" +
+                  std::to_string(network_.snapshot().counterTerroristScore)
+                : std::string(gameModeName(gameMode_));
+            discord_.update(details, presenceState,
+                            network_.connected() ? static_cast<int>(network_.snapshot().players.size()) + 1 : 1, 32);
+            discordTimer_ = 12.0f;
+        }
+        scoreboardOpen_ = input.scoreboardHeld;
+        aiming_ = input.aimHeld;
+        if (input.fullscreenPressed) fullscreenToggleRequested_ = true;
+        if (input.terroristPressed) network_.requestTeam(irx::Team::Terrorist);
+        if (input.counterTerroristPressed) network_.requestTeam(irx::Team::CounterTerrorist);
+
+        if (mode_ == Mode::Protection) {
+            updateParticles(deltaTime);
+            if (protectionTimer_ >= 2.35f) mode_ = Mode::Title;
+            return;
+        }
 
         if (mode_ == Mode::Title) {
             if (input.mapPressed) {
@@ -1297,7 +1364,7 @@ public:
                 audio_.play(SoundEffect::Pickup);
             }
             if (input.gameModePressed) {
-                gameMode_ = static_cast<GameMode>((static_cast<int>(gameMode_) + 1) % 4);
+                gameMode_ = static_cast<GameMode>((static_cast<int>(gameMode_) + 1) % 5);
                 audio_.play(SoundEffect::Pickup);
             }
             if (input.operatorPressed) {
@@ -1308,7 +1375,8 @@ public:
                 if (input.weaponPressed[static_cast<std::size_t>(i)]) switchWeapon(i);
             }
             if (input.confirmPressed || input.firePressed) {
-                reset(true);
+                if (network_.connected()) gameMode_ = GameMode::BombDefusal;
+                reset(!network_.connected());
                 mode_ = Mode::Playing;
                 audio_.play(SoundEffect::Start);
             } else if (input.pausePressed) {
@@ -1319,7 +1387,10 @@ public:
         }
         if (mode_ == Mode::Dead) {
             damageFlash_ = std::max(0.0f, damageFlash_ - deltaTime * 0.5f);
-            if (input.confirmPressed || input.firePressed) {
+            if (network_.connected() && network_.snapshot().selfHealth > 0) {
+                playerHealth_ = static_cast<float>(network_.snapshot().selfHealth);
+                mode_ = Mode::Playing;
+            } else if (!network_.connected() && (input.confirmPressed || input.firePressed)) {
                 reset(true);
                 mode_ = Mode::Playing;
             }
@@ -1344,9 +1415,32 @@ public:
         const bool* keys = SDL_GetKeyboardState(nullptr);
         updatePlayer(deltaTime, keys, input);
         updateWeapons(deltaTime, input);
-        updateBots(deltaTime);
-        updatePickups(deltaTime);
+        if (network_.connected()) {
+            std::uint8_t actions = 0;
+            if (input.fireHeld || input.firePressed) actions |= 1u;
+            if (crouching_) actions |= 2u;
+            if (reloadTimer_ > 0.0f || input.reloadPressed) actions |= 4u;
+            if (keys[SDL_SCANCODE_E] && network_.team() == irx::Team::Terrorist) actions |= 8u;
+            if (keys[SDL_SCANCODE_E] && network_.team() == irx::Team::CounterTerrorist) actions |= 16u;
+            if (input.grenadePressed && grenadeCooldown_ <= 0.0f) {
+                actions |= 32u;
+                grenadeCooldown_ = 5.0f;
+                audio_.play(SoundEffect::Grenade);
+            }
+            if (moving_) actions |= 64u;
+            if (keys[SDL_SCANCODE_LSHIFT] && moving_ && !crouching_) actions |= 128u;
+            network_.submit({playerPosition_, playerVelocity_, yaw_, pitch_,
+                             static_cast<std::uint8_t>(selectedWeapon_), actions, irx::Team::Spectator});
+            playerHealth_ = static_cast<float>(network_.snapshot().selfHealth);
+            if (network_.snapshot().hasSelfPosition &&
+                glm::distance2(playerPosition_, network_.snapshot().selfPosition) > 2.25f)
+                playerPosition_ = network_.snapshot().selfPosition;
+        } else {
+            updateBots(deltaTime);
+            updatePickups(deltaTime);
+        }
         updateParticles(deltaTime);
+        grenadeCooldown_ = std::max(0.0f, grenadeCooldown_ - deltaTime);
 
         damageFlash_ = std::max(0.0f, damageFlash_ - deltaTime * 1.65f);
         hitMarker_ = std::max(0.0f, hitMarker_ - deltaTime * 5.0f);
@@ -1354,7 +1448,7 @@ public:
         muzzleFlash_ = std::max(0.0f, muzzleFlash_ - deltaTime * 12.0f);
         weaponKick_ = glm::mix(weaponKick_, 0.0f, saturate(deltaTime * 14.0f));
 
-        if (bots_.empty()) {
+        if (!network_.connected() && bots_.empty()) {
             nextWaveTimer_ -= deltaTime;
             if (nextWaveTimer_ <= 0.0f) spawnWave();
         }
@@ -1370,7 +1464,7 @@ public:
 
         glm::vec3 eye;
         glm::vec3 forward;
-        if (mode_ == Mode::Title) {
+        if (mode_ == Mode::Title || mode_ == Mode::Protection) {
             eye = {std::sin(time_ * 0.17f) * 15.0f, 7.5f, std::cos(time_ * 0.17f) * 15.0f};
             forward = glm::normalize(glm::vec3(0.0f, 1.2f, 0.0f) - eye);
         } else {
@@ -1383,7 +1477,8 @@ public:
             }
         }
         const glm::mat4 view = glm::lookAt(eye, eye + forward, {0, 1, 0});
-        const glm::mat4 projection = glm::perspective(glm::radians(72.0f),
+        const float fieldOfView = aiming_ && mode_ == Mode::Playing ? 54.0f : 72.0f;
+        const glm::mat4 projection = glm::perspective(glm::radians(fieldOfView),
             static_cast<float>(std::max(width, 1)) / static_cast<float>(std::max(height, 1)), 0.045f, 100.0f);
         renderer_.setCamera(projection * view, eye);
 
@@ -1392,9 +1487,10 @@ public:
         if (mode_ == Mode::Title) renderOperator({0.0f, 0.0f, 0.0f}, 0.0f, selectedOperator_, true);
         else if (thirdPerson_) renderOperator(playerPosition_, yaw_, selectedOperator_, moving_);
         renderBots();
+        renderNetworkPlayers();
         renderParticles();
 
-        if (mode_ != Mode::Title && !thirdPerson_) {
+        if (mode_ != Mode::Title && mode_ != Mode::Protection && !thirdPerson_) {
             glClear(GL_DEPTH_BUFFER_BIT);
             renderWeapon(eye, forward);
         }
@@ -1405,6 +1501,11 @@ public:
     bool wantsMouseCapture() const { return mode_ == Mode::Playing && !inventoryOpen_; }
     bool quitRequested() const { return quitRequested_; }
     Mode mode() const { return mode_; }
+    bool takeFullscreenToggle() {
+        const bool requested = fullscreenToggleRequested_;
+        fullscreenToggleRequested_ = false;
+        return requested;
+    }
 
 private:
     void reset(bool startWave) {
@@ -1650,7 +1751,14 @@ private:
         const bool sprinting = keys[SDL_SCANCODE_LSHIFT] && moving_ && !crouching_;
         const float speed = crouching_ ? 3.05f : (sprinting ? 8.3f : 5.25f);
         playerPosition_ = moveWithCollision(playerPosition_, desired * speed * deltaTime, 0.42f);
-        if (moving_ && onGround_) stepTime_ += deltaTime * (sprinting ? 1.32f : 1.0f);
+        if (moving_ && onGround_) {
+            stepTime_ += deltaTime * (sprinting ? 1.32f : 1.0f);
+            const int footstepBucket = static_cast<int>(stepTime_ * 3.1f);
+            if (footstepBucket != lastFootstepBucket_) {
+                lastFootstepBucket_ = footstepBucket;
+                audio_.play(SoundEffect::Footstep);
+            }
+        }
 
         if (keys[SDL_SCANCODE_SPACE] && onGround_ && !jumpWasDown_) {
             playerVerticalVelocity_ = 5.5f;
@@ -2188,6 +2296,17 @@ private:
 
         const glm::vec4 lineColor{0.01f, 0.24f, 0.34f, 1.0f};
         const int gridStep = quality_ == 0 ? 4 : 2;
+        if (quality_ > 0) {
+            const glm::vec4 tileA{0.055f,0.07f,0.095f,1.0f};
+            const glm::vec4 tileB{0.075f,0.09f,0.115f,1.0f};
+            for (int x = -20; x <= 20; x += 4) {
+                for (int z = -20; z <= 20; z += 4) {
+                    const bool alternate = ((x / 4 + z / 4) & 1) != 0;
+                    renderer_.draw(cube_, modelMatrix({static_cast<float>(x),0.006f,static_cast<float>(z)},
+                                                       {3.94f,0.01f,3.94f}), alternate ? tileA : tileB);
+                }
+            }
+        }
         for (int i = -20; i <= 20; i += gridStep) {
             renderer_.draw(cube_, modelMatrix({static_cast<float>(i), 0.012f, 0}, {0.025f, 0.018f, 42.0f}), lineColor, 0, 0.45f);
             renderer_.draw(cube_, modelMatrix({0, 0.014f, static_cast<float>(i)}, {42.0f, 0.018f, 0.025f}), lineColor, 0, 0.45f);
@@ -2197,6 +2316,18 @@ private:
                  {-10, 2.1f, -21.4f}, {10, 2.1f, -21.4f}, {-21.4f, 2.1f, -10}, {21.4f, 2.1f, 10}}}) {
             renderer_.draw(cylinder_, modelMatrix(position, {0.10f, 4.2f, 0.10f}),
                            {0.05f, 0.76f, 1.0f, 1}, 0, 1.3f);
+        }
+        if (gameMode_ == GameMode::BombDefusal || network_.connected()) {
+            renderer_.draw(cylinder_, modelMatrix({12.0f,0.035f,12.0f}, {2.5f,0.035f,2.5f}),
+                           {1.0f,0.18f,0.08f,0.72f}, 0, 1.2f);
+            renderer_.draw(cylinder_, modelMatrix({-12.0f,0.035f,-12.0f}, {2.5f,0.035f,2.5f}),
+                           {1.0f,0.62f,0.08f,0.72f}, 0, 1.2f);
+            if (network_.snapshot().phase == irx::RoundPhase::BombPlanted) {
+                renderer_.draw(cube_, modelMatrix({12.0f,0.22f,12.0f}, {0.52f,0.30f,0.34f}, time_ * 0.8f),
+                               {0.08f,0.09f,0.11f,1.0f});
+                renderer_.draw(cube_, modelMatrix({12.0f,0.39f,12.0f}, {0.22f,0.08f,0.16f}, time_ * 0.8f),
+                               {1.0f,0.05f,0.03f,1.0f}, 0, 4.0f);
+            }
         }
     }
 
@@ -2221,24 +2352,26 @@ private:
         }
     }
 
-    void renderOperator(const glm::vec3& position, float yaw, int modelIndex, bool moving) {
+    void renderOperator(const glm::vec3& position, float yaw, int modelIndex, bool moving, int weaponIndex = -1,
+                        const glm::vec4& tint = glm::vec4(1.0f)) {
         if (modelIndex < 0 || modelIndex >= static_cast<int>(operatorModels_.size())) return;
         GltfModel& model = operatorModels_[static_cast<std::size_t>(modelIndex)];
         if (!model.valid()) return;
         const int animation = model.findAnimation(moving ? "sprint" : "idle");
         const glm::mat4 root = glm::translate(glm::mat4(1.0f), position) *
             glm::rotate(glm::mat4(1.0f), yaw, glm::vec3(0,1,0)) *
-            glm::scale(glm::mat4(1.0f), glm::vec3(0.205f));
-        model.drawAnimated(renderer_, root, animation, time_);
+            glm::scale(glm::mat4(1.0f), glm::vec3(0.245f));
+        model.drawAnimated(renderer_, root, animation, time_, tint);
 
-        if (selectedWeapon_ >= 0 && selectedWeapon_ < static_cast<int>(gunModels_.size()) &&
-            gunModels_[static_cast<std::size_t>(selectedWeapon_)].valid()) {
+        const int equippedWeapon = weaponIndex >= 0 ? weaponIndex : selectedWeapon_;
+        if (equippedWeapon >= 0 && equippedWeapon < static_cast<int>(gunModels_.size()) &&
+            gunModels_[static_cast<std::size_t>(equippedWeapon)].valid()) {
             const glm::mat4 gun = glm::translate(glm::mat4(1.0f), position) *
                 glm::rotate(glm::mat4(1.0f), yaw, glm::vec3(0,1,0)) *
                 glm::translate(glm::mat4(1.0f), {0.28f, 1.25f, 0.42f}) *
                 glm::rotate(glm::mat4(1.0f), -kPi * 0.5f, glm::vec3(0,1,0)) *
                 glm::scale(glm::mat4(1.0f), glm::vec3(0.20f));
-            gunModels_[static_cast<std::size_t>(selectedWeapon_)].draw(renderer_, gun);
+            gunModels_[static_cast<std::size_t>(equippedWeapon)].draw(renderer_, gun);
         }
     }
 
@@ -2308,6 +2441,24 @@ private:
             renderer_.draw(cube_, modelMatrix(bot.position + glm::vec3(-0.41f + 0.41f * healthRatio, 2.052f, 0.002f),
                                                {0.82f * healthRatio, 0.06f, 0.06f}),
                            healthRatio > 0.45f ? glm::vec4(0.1f,0.95f,0.45f,1) : glm::vec4(1,0.12f,0.16f,1), 0, 0.8f);
+        }
+    }
+
+    void renderNetworkPlayers() {
+        if (!network_.connected()) return;
+        for (const irx::RemotePlayer& player : network_.snapshot().players) {
+            if (!player.alive) continue;
+            const glm::vec4 teamColor = player.team == irx::Team::Terrorist
+                ? glm::vec4(1.0f,0.28f,0.08f,1.0f) : glm::vec4(0.08f,0.55f,1.0f,1.0f);
+            renderOperator(player.position, player.yaw, static_cast<int>(player.id % operatorModels_.size()),
+                           (player.flags & 64u) != 0, static_cast<int>(player.weapon), glm::mix(glm::vec4(1.0f), teamColor, 0.16f));
+            renderer_.draw(cylinder_, modelMatrix(player.position + glm::vec3(0,0.025f,0), {0.68f,0.025f,0.68f}),
+                           teamColor, 0, 1.5f);
+            const float health = saturate(static_cast<float>(player.health) / 100.0f);
+            renderer_.draw(cube_, modelMatrix(player.position + glm::vec3(0,2.22f,0), {0.92f,0.055f,0.055f}),
+                           {0.025f,0.03f,0.04f,1.0f});
+            renderer_.draw(cube_, modelMatrix(player.position + glm::vec3(-0.46f + 0.46f * health,2.225f,0.003f),
+                                               {0.92f * health,0.06f,0.06f}), teamColor, 0, 0.8f);
         }
     }
 
@@ -2428,7 +2579,7 @@ private:
             {"world_tour", "WORLD TOUR", "Deploy to every map", 6},
             {"high_score", "NEON LEGEND", "Score 5000 in one run", 5000}
         }};
-        char* preferenceDirectory = SDL_GetPrefPath("DeathAmir", "NeonAssault");
+        char* preferenceDirectory = SDL_GetPrefPath("IrAutoX", "iRx");
         if (preferenceDirectory != nullptr) {
             progressPath_ = std::filesystem::path(preferenceDirectory) / "achievements.txt";
             SDL_free(preferenceDirectory);
@@ -2500,12 +2651,28 @@ private:
         static constexpr std::array<const char*, 3> qualityNames = {{"POTATO", "BALANCED", "ULTRA"}};
         static constexpr std::array<const char*, 4> operatorNames = {{"WRAITH", "VIPER", "NOMAD", "SPECTRE"}};
 
+        if (mode_ == Mode::Protection) {
+            const float progress = saturate(protectionTimer_ / 2.35f);
+            renderer_.rect(0, 0, width, height, {0.002f,0.004f,0.012f,0.92f});
+            renderer_.text(width * 0.5f, height * 0.39f, "IRX", 12.0f, cyan, true);
+            renderer_.text(width * 0.5f, height * 0.54f, "PROTECTED BY IRAUTOX - AC", 3.0f, white, true);
+            renderer_.rect(width * 0.5f - 220.0f, height * 0.62f, 440.0f, 8.0f, {0.04f,0.06f,0.09f,1.0f});
+            renderer_.rect(width * 0.5f - 220.0f, height * 0.62f, 440.0f * progress, 8.0f, cyan);
+            renderer_.text(width * 0.5f, height * 0.67f, network_.status(), 1.7f,
+                           network_.connected() ? glm::vec4(0.25f,1.0f,0.52f,1.0f) : cyan, true);
+            return;
+        }
+
         if (mode_ == Mode::Title) {
             renderer_.rect(0, 0, width, height, {0.005f,0.008f,0.025f,0.56f});
-            renderer_.text(width * 0.5f, height * 0.24f, "NEON ASSAULT", 9.0f, cyan, true);
-            renderer_.text(width * 0.5f, height * 0.24f + 82.0f, "3D ARENA SHOOTER", 3.4f, white, true);
+            renderer_.text(width * 0.5f, height * 0.19f, "IRX", 11.0f, cyan, true);
+            renderer_.text(width * 0.5f, height * 0.19f + 92.0f, "TACTICAL STRIKE", 3.4f, white, true);
+            renderer_.text(width * 0.5f, height * 0.19f + 128.0f,
+                           std::string("IRAUTOX.IR:9832  /  ") + network_.status(), 1.55f,
+                           network_.connected() ? glm::vec4(0.25f,1.0f,0.52f,1.0f) : glm::vec4(1.0f,0.62f,0.12f,1.0f), true);
             renderer_.rect(width * 0.5f - 200, height * 0.72f - 18, 400, 50, {0.02f,0.18f,0.25f,0.88f});
-            renderer_.text(width * 0.5f, height * 0.72f, "PRESS ENTER TO DEPLOY", 3.0f, white, true);
+            renderer_.text(width * 0.5f, height * 0.72f,
+                           network_.connected() ? "ENTER  PLAY ONLINE" : "ENTER  PRACTICE OFFLINE", 2.8f, white, true);
             renderer_.rect(width * 0.5f - 330, height * 0.405f, 660, 174, panel);
             renderer_.text(width * 0.5f, height * 0.42f,
                            std::string("M MAP: ") + mapNames[static_cast<std::size_t>(selectedMap_)], 2.2f, white, true);
@@ -2525,7 +2692,7 @@ private:
             renderer_.text(width * 0.5f, height * 0.42f + 140,
                            std::string("1-0 LOADOUT: ") + loadout.name + "  [" + rarityName(loadout.rarity) + "]",
                            2.1f, rarityColor(loadout.rarity), true);
-            renderer_.text(width * 0.5f, height - 70, "WASD MOVE  MOUSE AIM  1-0 WEAPONS  TAB INVENTORY  V CAMERA", 1.75f,
+            renderer_.text(width * 0.5f, height - 70, "WASD MOVE  RMB AIM  B BUY  TAB SCOREBOARD  F1 T  F2 CT  F11 FULLSCREEN", 1.55f,
                            {0.55f,0.68f,0.78f,1}, true);
             renderer_.text(width - 12, height - 20, std::string("V") + NEON_VERSION, 1.4f,
                            {0.35f,0.45f,0.55f,1}, true);
@@ -2570,12 +2737,28 @@ private:
             renderer_.text(width - 68, height - 64, "R", 2.2f, cyan, true);
         }
 
-        renderer_.rect(24, 24, 270, 78, panel);
-        renderer_.text(42, 40, "WAVE " + std::to_string(wave_), 2.6f, cyan);
-        renderer_.text(42, 72, "HOSTILES " + std::to_string(bots_.size()), 2.0f, white);
-        renderer_.text(width - 34, 36, "SCORE " + std::to_string(score_), 2.4f, white, true);
+        renderer_.rect(24, 24, network_.connected() ? 390.0f : 270.0f, network_.connected() ? 104.0f : 78.0f, panel);
+        if (network_.connected()) {
+            const irx::MatchSnapshot& match = network_.snapshot();
+            const char* teamName = network_.team() == irx::Team::Terrorist ? "TERRORIST" :
+                                   (network_.team() == irx::Team::CounterTerrorist ? "COUNTER-TERRORIST" : "SPECTATOR");
+            renderer_.text(42, 38, std::string("IRX ONLINE  ") + teamName, 1.75f,
+                           network_.team() == irx::Team::Terrorist ? glm::vec4(1.0f,0.28f,0.08f,1.0f) : cyan);
+            renderer_.text(42, 66, "T " + std::to_string(match.terroristScore) + "   CT " +
+                           std::to_string(match.counterTerroristScore) + "   " +
+                           std::to_string(std::max(0, static_cast<int>(std::ceil(match.roundRemaining)))) + " SEC", 2.0f, white);
+            renderer_.text(42, 96, match.phase == irx::RoundPhase::BombPlanted
+                           ? "BOMB " + std::to_string(std::max(0, static_cast<int>(std::ceil(match.bombRemaining)))) + " SEC"
+                           : "E PLANT/DEFUSE   G GRENADE", 1.55f,
+                           match.phase == irx::RoundPhase::BombPlanted ? red : glm::vec4(0.55f,0.72f,0.82f,1.0f));
+            renderer_.text(width - 34, 36, "PING " + std::to_string(network_.pingMilliseconds()) + " MS", 1.7f, white, true);
+        } else {
+            renderer_.text(42, 40, "WAVE " + std::to_string(wave_), 2.6f, cyan);
+            renderer_.text(42, 72, "HOSTILES " + std::to_string(bots_.size()), 2.0f, white);
+            renderer_.text(width - 34, 36, "SCORE " + std::to_string(score_), 2.4f, white, true);
+        }
 
-        if (bots_.empty() && mode_ == Mode::Playing) {
+        if (!network_.connected() && bots_.empty() && mode_ == Mode::Playing) {
             renderer_.text(centerX, height * 0.28f, "AREA CLEAR", 4.0f, cyan, true);
             renderer_.text(centerX, height * 0.28f + 42, "NEXT WAVE IN " +
                            std::to_string(std::max(0, static_cast<int>(std::ceil(nextWaveTimer_)))), 2.2f, white, true);
@@ -2588,11 +2771,43 @@ private:
             renderer_.rect(width - 24, 0, 24, height, {1,0,0,alpha});
         }
 
+        if (scoreboardOpen_ && network_.connected()) {
+            renderer_.rect(0, 0, width, height, {0.002f,0.004f,0.012f,0.82f});
+            renderer_.rect(width * 0.5f - 430.0f, 74.0f, 860.0f, height - 148.0f, {0.012f,0.020f,0.045f,0.97f});
+            renderer_.text(width * 0.5f, 98.0f, "IRX MATCH SCOREBOARD", 3.8f, cyan, true);
+            renderer_.text(width * 0.5f, 142.0f, "PLAYER        TEAM        HP        WEAPON", 1.65f,
+                           {0.55f,0.68f,0.78f,1.0f}, true);
+            float rowY = 184.0f;
+            renderer_.text(width * 0.5f - 380.0f, rowY, "YOU #" + std::to_string(network_.selfId()), 1.8f, white);
+            renderer_.text(width * 0.5f - 120.0f, rowY,
+                           network_.team() == irx::Team::Terrorist ? "T" : "CT", 1.8f,
+                           network_.team() == irx::Team::Terrorist ? glm::vec4(1.0f,0.28f,0.08f,1.0f) : cyan);
+            renderer_.text(width * 0.5f + 40.0f, rowY, std::to_string(static_cast<int>(playerHealth_)), 1.8f, white);
+            renderer_.text(width * 0.5f + 190.0f, rowY, weaponDefinitions_[static_cast<std::size_t>(selectedWeapon_)].name, 1.5f, white);
+            rowY += 38.0f;
+            for (const irx::RemotePlayer& player : network_.snapshot().players) {
+                if (rowY > height - 105.0f) break;
+                const glm::vec4 teamColor = player.team == irx::Team::Terrorist
+                    ? glm::vec4(1.0f,0.28f,0.08f,1.0f) : cyan;
+                renderer_.text(width * 0.5f - 380.0f, rowY, "PLAYER #" + std::to_string(player.id), 1.8f,
+                               player.alive ? white : glm::vec4(0.42f,0.46f,0.52f,1.0f));
+                renderer_.text(width * 0.5f - 120.0f, rowY,
+                               player.team == irx::Team::Terrorist ? "T" : "CT", 1.8f, teamColor);
+                renderer_.text(width * 0.5f + 40.0f, rowY, std::to_string(player.health), 1.8f, white);
+                const std::size_t weaponIndex = std::min<std::size_t>(player.weapon, weaponDefinitions_.size() - 1);
+                renderer_.text(width * 0.5f + 190.0f, rowY, weaponDefinitions_[weaponIndex].name, 1.5f, white);
+                rowY += 38.0f;
+            }
+            renderer_.text(width * 0.5f, height - 102.0f, "F1 JOIN TERRORIST   F2 JOIN COUNTER-TERRORIST", 1.6f, white, true);
+            renderAchievementPopup(width);
+            return;
+        }
+
         if (inventoryOpen_) {
             renderer_.rect(0, 0, width, height, {0.002f,0.004f,0.012f,0.90f});
             renderer_.rect(62, 42, width - 124, height - 84, {0.012f,0.020f,0.045f,0.97f});
             renderer_.text(width * 0.5f, 66, "ARSENAL / ACHIEVEMENTS", 4.0f, cyan, true);
-            renderer_.text(width * 0.5f, 108, "PRESS 1-0 TO EQUIP  -  TAB TO CLOSE", 1.6f,
+            renderer_.text(width * 0.5f, 108, "PRESS 1-0 TO EQUIP  -  B TO CLOSE", 1.6f,
                            {0.56f,0.68f,0.78f,1}, true);
             const float cardWidth = (width - 190.0f) * 0.5f;
             for (int i = 0; i < static_cast<int>(weaponDefinitions_.size()); ++i) {
@@ -2686,6 +2901,8 @@ private:
     std::vector<Pickup> pickups_;
     std::vector<Particle> particles_;
     std::vector<Tracer> tracers_;
+    irx::NetClient network_;
+    irx::DiscordRpc discord_;
     std::mt19937 random_{0x4e454f4eu};
     Mode mode_ = Mode::Title;
     glm::vec3 playerPosition_{0,0,8};
@@ -2707,6 +2924,9 @@ private:
     float hitMarker_ = 0.0f;
     float killMarker_ = 0.0f;
     float achievementPopupTimer_ = 0.0f;
+    float protectionTimer_ = 0.0f;
+    float grenadeCooldown_ = 0.0f;
+    float discordTimer_ = 0.0f;
     std::string achievementPopup_;
     std::filesystem::path progressPath_;
     std::uint32_t weaponUsageMask_ = 0;
@@ -2722,14 +2942,18 @@ private:
     int selectedOperator_ = 0;
     int difficulty_ = 1;
     int quality_ = 1;
-    GameMode gameMode_ = GameMode::Survival;
+    int lastFootstepBucket_ = -1;
+    GameMode gameMode_ = GameMode::BombDefusal;
     bool inventoryOpen_ = false;
+    bool scoreboardOpen_ = false;
+    bool aiming_ = false;
     bool thirdPerson_ = false;
     bool crouching_ = false;
     bool moving_ = false;
     bool onGround_ = true;
     bool jumpWasDown_ = false;
     bool quitRequested_ = false;
+    bool fullscreenToggleRequested_ = false;
 };
 
 int runSelfTests() {
@@ -2748,7 +2972,7 @@ int runSelfTests() {
     expect(raySphere({0,0,5}, {0,0,-1}, {0,0,0}, 1.0f, distance) &&
            std::abs(distance - 4.0f) < 0.001f, "ray hits sphere at expected distance");
     expect(!raySphere({4,0,5}, {0,0,-1}, {0,0,0}, 1.0f, distance), "ray misses sphere");
-    if (failures == 0) std::cout << "Neon Assault self-tests passed.\n";
+    if (failures == 0) std::cout << "iRx self-tests passed.\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -2757,7 +2981,7 @@ int runSelfTests() {
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "--self-test") return neon::runSelfTests();
 
-    SDL_SetAppMetadata("Neon Assault", NEON_VERSION, "io.github.deathamir.neonassault");
+    SDL_SetAppMetadata("iRx", NEON_VERSION, "ir.irautox.irx");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "SDL initialization failed: %s\n", SDL_GetError());
         return EXIT_FAILURE;
@@ -2771,7 +2995,7 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_FRAMEBUFFER_SRGB_CAPABLE, 1);
 
-    SDL_Window* window = SDL_CreateWindow("NEON ASSAULT", 1600, 900,
+    SDL_Window* window = SDL_CreateWindow("iRx - Tactical Strike", 1600, 900,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (window == nullptr) {
         std::fprintf(stderr, "Window creation failed: %s\n", SDL_GetError());
@@ -2805,6 +3029,7 @@ int main(int argc, char** argv) {
         neon::InputFrame input;
         bool running = true;
         bool mouseCaptured = false;
+        bool fullscreen = false;
         auto previous = std::chrono::steady_clock::now();
 
         while (running && !game.quitRequested()) {
@@ -2819,6 +3044,10 @@ int main(int argc, char** argv) {
             const float deltaTime = std::chrono::duration<float>(now - previous).count();
             previous = now;
             game.update(deltaTime, input);
+            if (game.takeFullscreenToggle()) {
+                fullscreen = !fullscreen;
+                SDL_SetWindowFullscreen(window, fullscreen);
+            }
 
             const bool desiredCapture = game.wantsMouseCapture();
             if (desiredCapture != mouseCaptured) {
@@ -2837,7 +3066,7 @@ int main(int argc, char** argv) {
         }
     } catch (const std::exception& exception) {
         std::fprintf(stderr, "Fatal error: %s\n", exception.what());
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Neon Assault", exception.what(), window);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "iRx", exception.what(), window);
         result = EXIT_FAILURE;
     }
 

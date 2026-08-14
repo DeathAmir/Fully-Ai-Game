@@ -1,38 +1,26 @@
-# NEON ASSAULT — Arsenal Update
+# iRx — Tactical Multiplayer
 
-Neon Assault is a single-player 3D arena shooter written in C++20 with SDL3
-and OpenGL 3.3. Version 0.2 expands the original prototype into a licensed
-content build with animated operators, real weapon meshes, tactical bots,
-multiple modes, inventory, rarity tiers and persistent achievements.
+iRx is a C++20 tactical shooter built with SDL3 and OpenGL 3.3. Version 0.3 adds the first authoritative multiplayer release, connects to `irautox.ir:9832`, rebrands the client, and keeps the existing offline arena mode available when the server cannot be reached.
 
-## Playable content
+## Multiplayer
 
-- **6 maps:** Neon Yard, Dust Depot, Ice Lab, Suburban Siege, Orbital Station
-  and Iron Foundry. The last three use optimized CC0 environment packs from
-  Kenney with independent collision proxies for reliable movement and AI.
-- **10 balanced weapons:** pistol, assault rifle, shotgun, SMG, DMR, sniper,
-  Nova Blaster, Dragon Core, Void Cannon and Rail Lancer.
-- **Rarity system:** Common, Uncommon, Rare, Epic, Legendary and Mythic.
-  Legendary and Mythic equipment has unique accent rendering; Mythic weapons
-  produce radial neon kill effects.
-- **Licensed model library:** 25 recognizable firearm/attachment models by
-  Quaternius, 40 Kenney blaster assets, 18 operator variants and more than 200
-  map GLBs. Every upstream archive has a pinned SHA-256 hash.
-- **4 full-body operators:** Wraith, Viper, Nomad and Spectre. Object-based
-  glTF animation supports idle, sprint, armed and shooting clips without a
-  heavyweight engine runtime.
-- **Tactical bots:** A* navigation grid, obstacle routing, visual memory,
-  gunshot hearing, reaction delay, burst fire, target leading, dynamic cover,
-  separation and four complementary roles: assault, flanker, marksman and
-  rusher.
-- **4 modes:** Survival, Elimination, Head Hunter and Mythic Mayhem.
-- **Inventory and loadout:** select weapons in the lobby or in the in-game
-  Arsenal screen, with damage, magazine and rarity information.
-- **8 persistent achievements:** progress is stored in SDL's per-user
-  preference directory and survives restarts.
-- First-person and third-person cameras, responsive mouse aim, sprint, crouch,
-  jump, recoil, reloads, ammo pickups, headshots, procedural audio, particles,
-  damage feedback and scalable Potato/Balanced/Ultra profiles.
+- Versioned UDP protocol with a stateless HMAC challenge, per-session tokens, sequence validation, packet limits, rate limits, timeouts and a 30 Hz input stream.
+- Server-authoritative health, movement limits, fire rate, magazines, reloads, hit detection, grenades, teams, round timer, bomb plant/defuse state and round score.
+- Terrorist and Counter-Terrorist teams, F1/F2 team selection, remote full-body operators, weapon state, team colors, health bars and a hold-Tab scoreboard.
+- Bomb sites A and B, crouch-to-plant/defuse interaction, round warmup, planted-bomb timer and team win conditions.
+- The dedicated Python server stores achievements, admins, bans and audit events in SQLite. The server source is delivered privately and is not included in this public client repository.
+- IrAutoX AC startup screen and server-side checks for speed, teleporting, invalid input, fire-rate manipulation, replayed packets and abusive packet rates.
+
+## Content
+
+- Six arenas with licensed CC0 environment models, material-bearing glTF assets, collision proxies, tiled floor treatment and scalable graphics profiles.
+- Ten weapon classes from Common through Mythic, licensed models, distinct damage, magazine, spread, recoil, reload and fire-rate values.
+- Legendary and Mythic glow, tracer and kill-particle treatments.
+- Four full-body operators with idle and sprint animation, corrected player scale and weapon placement.
+- Procedural shot, reload, empty-magazine, hit, kill, pickup, grenade, plant, defuse and footstep audio.
+- Offline A* tactical bots, inventory, loadouts and eight persistent local achievements.
+- `.na1`, `.na2` and later chunk extensions plus an integrity-checked `.naupk` manifest for compact asset updates.
+- Native Discord IPC Rich Presence with mode, team, score and party size. Set `IRX_DISCORD_APP_ID` in the environment or pass `-DIRX_DISCORD_APP_ID=...` while configuring after creating the Discord application and its `irx` art asset.
 
 ## Controls
 
@@ -40,50 +28,40 @@ multiple modes, inventory, rarity tiers and persistent achievements.
 |---|---|
 | `W A S D` | Move |
 | Mouse / left mouse | Aim / fire |
+| Right mouse | Aim down sights |
 | `R` | Reload |
-| `1` through `0` or wheel | Select one of ten weapons |
+| `1` through `0` or wheel | Select weapon |
 | `Shift` / `Ctrl` / `Space` | Sprint / crouch / jump |
-| `Tab` | Arsenal inventory and achievements |
-| `V` | Toggle first/third-person camera |
+| `B` | Buy and arsenal menu |
+| Hold `Tab` | Multiplayer scoreboard |
+| Hold `E` while crouched | Plant or defuse at a bomb site |
+| `G` | Grenade |
+| `F1` / `F2` | Join Terrorist / Counter-Terrorist |
+| `V` | First/third-person camera |
+| `F11` | Full screen |
 | `Esc` | Pause / release mouse |
-| `Enter` | Start / restart |
-| `M` in lobby | Change map |
-| `G` in lobby | Change game mode |
-| `C` in lobby | Change operator |
-| `D` / `Q` in lobby | Change difficulty / graphics profile |
 
 ## Windows download
 
-Open the repository's **Releases** page, download
-`NeonAssault-Windows-x64.zip`, extract the entire archive, and run `PLAY.bat`.
-The ZIP is portable and includes SDL3 plus the licensed runtime content. OpenGL
-is supplied by the Windows graphics driver.
+Open [Releases](../../releases), download `iRx-Windows-x64.zip`, extract the complete archive and run `PLAY.bat`. `iRx-AssetPacks.zip` contains the verified NAUPK update chunks.
 
-## Build from source
+## Build
 
-Requirements: Git, CMake 3.25+, a C++20 compiler and internet access during the
-first configure. SDL3, GLM, GLEW, tinygltf and all licensed content are pinned
-and fetched reproducibly.
+Requirements are Git, CMake 3.25+, a C++20 compiler and internet access during the first configure.
 
 ```bash
 cmake -S . -B build -DNEON_FETCH_ASSETS=ON
 cmake --build build --config Release --parallel
+cmake --install build --config Release --prefix dist/iRx
 ```
 
-Create a portable directory on Windows:
+Create and verify update chunks:
 
 ```bash
-cmake --install build --config Release --prefix dist/NeonAssault
+python tools/pack_assets.py create dist/iRx/assets dist/iRxAssetPacks --chunk-mb 96
+python tools/pack_assets.py verify dist/iRxAssetPacks/assets.naupk
 ```
 
-`-DNEON_FETCH_ASSETS=OFF` creates a source-only fallback build without the
-external models. Procedural geometry remains available when an optional model
-cannot be loaded.
+## Licensing
 
-## Licensing and provenance
-
-All bundled art is CC0. Exact creators, pack names, source pages and license
-links are documented in [`assets/CREDITS.md`](assets/CREDITS.md). Upstream
-archives and individual Khronos models are checked against SHA-256 hashes in
-[`cmake/FetchGameAssets.cmake`](cmake/FetchGameAssets.cmake). The project does
-not redistribute ripped assets or content from commercial games.
+All bundled art is CC0. Exact creators, source pages and license links are in [`assets/CREDITS.md`](assets/CREDITS.md). The project does not redistribute content ripped from Counter-Strike, Call of Duty or other commercial games. Gameplay code is original and uses genre-standard tactical shooter concepts rather than copied commercial source.
